@@ -72,6 +72,9 @@ parse_params "$@"
 
 # --- End of CLI template ---
 
+# shellcheck source=all-node/linux-package/rpm-common.sh
+source "$SCRIPT_DIR_PATH/all-node/linux-package/rpm-common.sh"
+
 UBUNTU2204_SUPPORTED_MINOR_VERSION=5
 UBUNTU2404_SUPPORTED_MINOR_VERSION=4
 RHEL8_SUPPORTED_MINOR_VERSION=10
@@ -199,8 +202,8 @@ ubuntu2404_setup() {
 
 rhel8_setup() {
   if [[ $(rhel_is_installed python3\.12) = "false" ]]; then
-    rpm --force -Uvh --oldpackage --replacepkgs "$KI_OPT_BUNDLE_PATH/linux-packages/rhel8/chkconfig/*.rpm"
-    rpm --force -Uvh --oldpackage --replacepkgs "$KI_OPT_BUNDLE_PATH/linux-packages/rhel8/python3.12/*.rpm"
+    rhel_install_dir "$KI_OPT_BUNDLE_PATH/linux-packages/rhel8/chkconfig"
+    rhel_install_dir "$KI_OPT_BUNDLE_PATH/linux-packages/rhel8/python3.12"
   fi
 
   if [[ -e $KI_OPT_VENV_PATH ]]; then
@@ -234,11 +237,33 @@ rhel8_setup() {
 # can load the openssl it brings - and a node that got python3.12 some other
 # way, from AppStream by hand or from an earlier run of this, has none of that
 # and dies at ensurepip or loses its sshd. rpm leaves what is already at the
-# version the directory holds alone
+# version the directory holds alone.
+#
+# What the node holds at a newer version it keeps, by the source rpm it was
+# built from (plan-rpm-install.py). A newer minor already carries an expat and
+# an openssl at least as new as the ones the directory brings, and downgrading
+# them breaks the packages of the node pinned to them, openssl-devel among them
 rhel9_setup() {
-  rpm --force -Uvh --oldpackage --replacepkgs "$KI_OPT_BUNDLE_PATH/linux-packages/rhel9/python3.12/*.rpm"
+  rhel_install_dir "$KI_OPT_BUNDLE_PATH/linux-packages/rhel9/python3.12"
 
   rhel_create_venv
+
+  return 0
+}
+
+# Everything here is the dependency closure of python3.12, so nothing is
+# declared by the release and every package is planned as a dependency
+rhel_install_dir() {
+  local dir=$1
+
+  local files=()
+  local rpm_file
+  for rpm_file in "$dir"/*.rpm; do
+    [[ -e $rpm_file ]] && files+=("$rpm_file")
+  done
+  [[ ${#files[@]} = 0 ]] && return 0
+
+  rpm_install_files "$(basename "$dir")" -- "${files[@]}"
 
   return 0
 }

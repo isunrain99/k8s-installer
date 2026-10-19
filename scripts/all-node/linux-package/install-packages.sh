@@ -72,6 +72,9 @@ parse_params "$@"
 
 # --- End of CLI template ---
 
+# shellcheck source=rpm-common.sh
+source "$SCRIPT_DIR_PATH/rpm-common.sh"
+
 UBUNTU2204_SUPPORTED_MINOR_VERSION=5
 UBUNTU2404_SUPPORTED_MINOR_VERSION=4
 RHEL8_SUPPORTED_MINOR_VERSION=10
@@ -87,6 +90,15 @@ yq_cmd=""
 
 k8s_minor_version=""
 k8s_packages_path=""
+
+# What a rhel install erases before it lays the bundle down: the time services
+# the bundled chrony replaces, and the container tools containerd.io conflicts
+# with
+RHEL_ERASED_PACKAGES=(systemd-timesyncd ntp chrony podman runc systemd-container)
+
+# The arguments plan-rpm-install.py is given on this node: which packages are
+# the release's own and go in at their version whatever the node holds
+rpm_plan_args=()
 
 os_info=""
 os_distribution=""
@@ -201,6 +213,23 @@ rhel8_install() {
   require_packages_installable
   set_k8s_packages_path rhel8
   require_declared_packages rhel8 rpm
+  setup_rpm_plan_args
+
+  local dirs=(
+    nfs-utils
+    p11-kit autogen-libopts gmp libidn2 libtasn1 nettle gnutls chrony
+    audit libsepol pcre2 libselinux libsemanage python3-setools checkpolicy mcstrans
+    policycoreutils selinux-policy container-selinux libseccomp containerd
+    systemd
+    libaio device-mapper fuse3 fuse-overlayfs libcgroup slirp conntrack
+  )
+  if [[ $(rhel_is_installed "^libibverbs\.") = "false" ]]; then
+    dirs+=(libibverbs)
+  fi
+  dirs+=(ebtables nftables docker nvidia-container-toolkit ethtool libbpf iproute socat)
+
+  local base="$ki_opt_bundle_path/linux-packages/rhel8"
+  rhel_require_installable "$base" "${dirs[@]}"
 
   [[ $(getenforce) != "Disabled" ]] && setenforce 0
 
@@ -214,54 +243,13 @@ rhel8_install() {
     runc \
     systemd-container
 
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/nfs-utils
-
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/p11-kit
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/autogen-libopts
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/gmp
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/libidn2
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/libtasn1
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/nettle
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/gnutls
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/chrony
-
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/audit
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/libsepol
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/pcre2
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/libselinux
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/libsemanage
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/python3-setools
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/checkpolicy
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/mcstrans
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/policycoreutils
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/selinux-policy
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/container-selinux
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/libseccomp
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/containerd
-
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/systemd
-  kill -TERM 1
-  wait_systemd_ready 300
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/libaio
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/device-mapper
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/fuse3
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/fuse-overlayfs
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/libcgroup
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/slirp
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/conntrack
-  if [[ $(rhel_is_installed "^libibverbs\.") = "false" ]]; then
-    rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/libibverbs
-  fi
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/ebtables
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/nftables
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/docker
-
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/nvidia-container-toolkit
-
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/ethtool
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/libbpf
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/iproute
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/rhel8/socat
+  local dir
+  for dir in "${dirs[@]}"; do
+    rhel_install_rpms "$base/$dir"
+    if [[ $dir = "systemd" ]]; then
+      rhel_reexec_systemd_if_installed
+    fi
+  done
   rhel_install_rpms "$k8s_packages_path"
 
   "$ki_opt_scripts_path/systemctl.sh" reload
@@ -295,6 +283,21 @@ rhel_install() {
   require_packages_installable
   set_k8s_packages_path "$os_dir"
   require_declared_packages "$os_dir" rpm
+  setup_rpm_plan_args
+
+  # The openssl systemd brings is one the sshd of an old minor refuses to load,
+  # so the openssh built against it follows at once. Its package restarts sshd;
+  # the connection this runs over survives that, and the next one is served by
+  # the new daemon. On a minor that already holds both at a newer version, the
+  # plan keeps the two of them
+  local dirs=(nfs-utils chrony container-selinux containerd systemd openssh fuse-overlayfs slirp conntrack)
+  if [[ $(rhel_is_installed "^libibverbs\.") = "false" ]]; then
+    dirs+=(libibverbs)
+  fi
+  dirs+=(iptables-nft nftables docker nvidia-container-toolkit ethtool iproute socat)
+
+  local base="$ki_opt_bundle_path/linux-packages/$os_dir"
+  rhel_require_installable "$base" "${dirs[@]}"
 
   [[ $(getenforce) != "Disabled" ]] && setenforce 0
 
@@ -308,35 +311,13 @@ rhel_install() {
     runc \
     systemd-container
 
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/nfs-utils
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/chrony
-
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/container-selinux
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/containerd
-
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/systemd
-  kill -TERM 1
-  wait_systemd_ready 300
-  # The openssl systemd brought is one the sshd of an old minor refuses to load,
-  # so the openssh built against it follows at once. Its package restarts sshd;
-  # the connection this runs over survives that, and the next one is served by
-  # the new daemon
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/openssh
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/fuse-overlayfs
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/slirp
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/conntrack
-  if [[ $(rhel_is_installed "^libibverbs\.") = "false" ]]; then
-    rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/libibverbs
-  fi
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/iptables-nft
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/nftables
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/docker
-
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/nvidia-container-toolkit
-
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/ethtool
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/iproute
-  rhel_install_rpms "$ki_opt_bundle_path"/linux-packages/"$os_dir"/socat
+  local dir
+  for dir in "${dirs[@]}"; do
+    rhel_install_rpms "$base/$dir"
+    if [[ $dir = "systemd" ]]; then
+      rhel_reexec_systemd_if_installed
+    fi
+  done
   rhel_install_rpms "$k8s_packages_path"
 
   "$ki_opt_scripts_path/systemctl.sh" reload
@@ -466,7 +447,10 @@ list_bundled_packages() {
 # is not written around that one name.
 #
 # Leaving what is already installed alone is also what an update is asking for. A
-# version the node does not have still goes in, downgrade and all
+# package release.yml declares that the node holds at another version still goes
+# in, downgrade and all. A dependency the node holds at a newer version does not:
+# plan-rpm-install.py says why, and rpm_install_files of rpm-common.sh prints it
+#
 # Hands dpkg the directories of an ubuntu, in the order the dependencies between
 # them want. One list for both: a directory is one principal and what the GA
 # image of that ubuntu lacks for it (tools/build-bundle-packages.sh fills them),
@@ -519,23 +503,67 @@ ubuntu_install_deb_dir() {
 rhel_install_rpms() {
   local dir=$1
 
-  local to_install=()
+  local files=()
   local rpm_file
-  local nvr
   for rpm_file in "$dir"/*.rpm; do
     # An unmatched glob arrives as itself, which is a directory holding no rpm
-    [[ -e $rpm_file ]] || continue
-
-    # The epoch is left out, since that is the form "rpm -q" takes
-    nvr=$(rpm -qp --queryformat '%{NAME}-%{VERSION}-%{RELEASE}' "$rpm_file" 2>/dev/null)
-    [[ -n $nvr ]] && rpm -q "$nvr" &>/dev/null && continue
-
-    to_install+=("$rpm_file")
+    [[ -e $rpm_file ]] && files+=("$rpm_file")
   done
 
-  [[ ${#to_install[@]} = 0 ]] && return 0
+  rpm_installed_count=0
+  [[ ${#files[@]} = 0 ]] && return 0
 
-  rpm --force -Uvh --oldpackage --replacepkgs "${to_install[@]}"
+  rpm_install_files "$(basename "$dir")" "${rpm_plan_args[@]}" -- "${files[@]}"
+
+  return 0
+}
+
+# The packages release.yml declares, and the packages of kubernetes, go in at
+# their version whatever the node holds. Every other rpm of the bundle is a
+# dependency, which the node keeps where it holds a newer one
+setup_rpm_plan_args() {
+  rpm_plan_args=(--principal-dir "$k8s_packages_path")
+
+  local name
+  while read -r name; do
+    [[ -n $name ]] && rpm_plan_args+=(--principal "$name")
+  done < <($yq_cmd '.ki_release_packages // {} | keys | .[]' < "$vars_path")
+
+  return 0
+}
+
+# Refuses the node before anything is erased, if rpm would refuse what the plan
+# lays down
+rhel_require_installable() {
+  local base=$1
+  shift
+
+  local files=()
+  local dir
+  local rpm_file
+  for dir in "$@" "$k8s_packages_path"; do
+    [[ $dir = /* ]] || dir="$base/$dir"
+    for rpm_file in "$dir"/*.rpm; do
+      [[ -e $rpm_file ]] && files+=("$rpm_file")
+    done
+  done
+
+  rpm_require_installable "${RHEL_ERASED_PACKAGES[@]}" -- "${rpm_plan_args[@]}" -- "${files[@]}"
+
+  return 0
+}
+
+# systemd re-executes on SIGTERM to pid 1, which is how the one just laid down
+# takes over without a reboot. Where the node kept its own, there is nothing to
+# take over
+rhel_reexec_systemd_if_installed() {
+  if [[ $rpm_installed_count = 0 ]]; then
+    msg "[INFO] systemd of the node is kept. not re-executing it"
+    return 0
+  fi
+
+  kill -TERM 1
+  wait_systemd_ready 300
 
   return 0
 }
