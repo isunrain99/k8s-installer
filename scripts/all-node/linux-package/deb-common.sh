@@ -129,12 +129,45 @@ deb_plan() {
     else
       principals+=("false")
       if [[ $state = "newer" && -z ${kept_sources["$source"]+x} ]]; then
-        kept_sources["$source"]="$name $installed"
+        kept_sources["$source"]="the node holds $name $installed, newer than the bundle"
       fi
     fi
   done
 
+  # The other way a source is kept: the bundle would upgrade one of its debs
+  # while the node holds another one of the same source that the bundle does
+  # not carry, which depends on the old version exactly and which nothing
+  # would move along
+  local -A in_bundle=()
   local i
+  for i in "${!paths[@]}"; do
+    in_bundle["${sources[$i]}|${names[$i]}"]=1
+  done
+
+  local -A node_by_source=()
+  local node_source
+  local node_name
+  local node_status
+  while IFS=$'\t' read -r node_source node_name node_status; do
+    [[ $node_status = ii* ]] || continue
+    [[ -z $node_source ]] && node_source=$node_name
+    deb_is_assumed_absent "$node_name" && continue
+    node_by_source["$node_source"]+=" $node_name"
+  done < <(dpkg-query -W -f='${source:Package}\t${Package}\t${db:Status-Abbrev}\n' 2>/dev/null || true)
+
+  local stranded
+  for i in "${!paths[@]}"; do
+    [[ ${principals[$i]} = "true" || ${states[$i]} != "older" ]] && continue
+    [[ -n ${kept_sources["${sources[$i]}"]+x} ]] && continue
+    stranded=""
+    for node_name in ${node_by_source["${sources[$i]}"]-}; do
+      [[ -z ${in_bundle["${sources[$i]}|$node_name"]+x} ]] && stranded+=" $node_name"
+    done
+    if [[ -n $stranded ]]; then
+      kept_sources["${sources[$i]}"]="upgrading ${names[$i]} past ${installed_versions[$i]} would leave${stranded} of the node, which the bundle does not carry, pinned to the old version"
+    fi
+  done
+
   for i in "${!paths[@]}"; do
     name=${names[$i]}
     version=${versions[$i]}
@@ -145,9 +178,13 @@ deb_plan() {
     elif [[ ${states[$i]} = "newer" ]]; then
       printf 'skip\t%s\t%s\n' "${paths[$i]}" "the node holds $name ${installed_versions[$i]}, newer than $version"
     elif [[ -n ${kept_sources["${sources[$i]}"]+x} ]]; then
-      printf 'skip\t%s\t%s\n' "${paths[$i]}" "built from ${sources[$i]}, of which the node holds ${kept_sources["${sources[$i]}"]}, newer than the bundle"
+      printf 'skip\t%s\t%s\n' "${paths[$i]}" "source ${sources[$i]} is kept: ${kept_sources["${sources[$i]}"]}"
     else
-      printf 'install\t%s\t%s\n' "${paths[$i]}" "${states[$i]/absent/not installed}"
+      if [[ ${states[$i]} = "absent" ]]; then
+        printf 'install\t%s\t%s\n' "${paths[$i]}" "not installed"
+      else
+        printf 'install\t%s\t%s\n' "${paths[$i]}" "upgrades ${installed_versions[$i]}"
+      fi
     fi
   done
 

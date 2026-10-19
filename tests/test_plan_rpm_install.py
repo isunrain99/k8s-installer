@@ -29,7 +29,7 @@ def plan(tmp_path, packages):
     return {path: action for action, path, _ in lines}
 
 
-def pkg(name, srpm, installed=None, principal=False, evr="0:1.0-1.el9"):
+def pkg(name, srpm, installed=None, principal=False, evr="0:1.0-1.el9", node_family=()):
     return {
         "file": f"{name}.rpm",
         "name": name,
@@ -38,7 +38,44 @@ def pkg(name, srpm, installed=None, principal=False, evr="0:1.0-1.el9"):
         "principal": principal,
         "installed": installed,
         "installed_evr": None if installed is None else "0:9.9-9.el9",
+        "node_family": list(node_family),
     }
+
+
+def test_an_upgrade_that_strands_a_package_of_the_node_is_not_made(tmp_path):
+    # The bundle carries a newer nftables, and the node also holds
+    # python3-nftables, which requires nftables at exactly its own version and
+    # which the bundle does not carry
+    actions = plan(tmp_path, [
+        pkg("nftables", "nftables-1.0.9-6.el9.src.rpm", installed="older",
+            node_family=["nftables", "python3-nftables"]),
+    ])
+
+    assert actions == {"nftables.rpm": "skip"}
+
+
+def test_an_upgrade_is_made_when_the_bundle_carries_the_whole_source(tmp_path):
+    actions = plan(tmp_path, [
+        pkg("device-mapper", "lvm2-2.03.28-6.el9.src.rpm", installed="older",
+            node_family=["device-mapper", "device-mapper-libs"]),
+        pkg("device-mapper-libs", "lvm2-2.03.28-6.el9.src.rpm", installed="older",
+            node_family=["device-mapper", "device-mapper-libs"]),
+    ])
+
+    assert actions == {"device-mapper.rpm": "install", "device-mapper-libs.rpm": "install"}
+
+
+def test_the_source_is_matched_by_name_whatever_version_it_was_built_at(tmp_path):
+    # device-mapper of the bundle and device-mapper-event of the node come from
+    # lvm2 at different versions; they are one source all the same
+    actions = plan(tmp_path, [
+        pkg("device-mapper", "lvm2-2.03.28-6.el9.src.rpm", installed="older",
+            node_family=["device-mapper", "device-mapper-event"]),
+        pkg("device-mapper-libs", "lvm2-2.03.28-6.el9.src.rpm",
+            node_family=["device-mapper", "device-mapper-event"]),
+    ])
+
+    assert actions == {"device-mapper.rpm": "skip", "device-mapper-libs.rpm": "skip"}
 
 
 def test_a_dependency_the_node_holds_newer_is_kept(tmp_path):

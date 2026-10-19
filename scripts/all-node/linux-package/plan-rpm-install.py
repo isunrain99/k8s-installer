@@ -21,6 +21,14 @@ package of such a source rpm that the node does not hold at all is left out with
 the rest, and if something needs it, the rpm --test that follows says so before
 the node is touched.
 
+The other direction stops the same way. Where the bundle is the newer one, it
+upgrades nftables, and the node also holds python3-nftables, built from the same
+source and not in the bundle, which requires nftables at exactly its own version.
+Nothing would move python3-nftables along, so that source is kept as the node
+has it too. rhel 8 nodes with python3-nftables and rhel 9.7 nodes with
+device-mapper-event met this one. Sources are matched by name, not by the
+version they were built at.
+
 A newer library satisfies what was built against an older one of the same major
 version: the soname is the same and every older symbol version is still there,
 and rpm checks both, since what a binary links against is written into its
@@ -53,14 +61,58 @@ NEWER = "newer"
 OLDER = "older"
 
 
-def decide(packages):
-    """packages: dicts with file, name, evr, srpm, principal, and installed
-    (None, SAME, NEWER or OLDER) with installed_evr. Returns (action, file,
-    reason) in the order given, one per distinct file."""
-    kept_srpms = {}
+def source_name(srpm):
+    """lvm2-2.03.28-6.el9.src.rpm -> lvm2"""
+    if not srpm:
+        return None
+    for suffix in (".src.rpm", ".nosrc.rpm"):
+        if srpm.endswith(suffix):
+            srpm = srpm[: -len(suffix)]
+    parts = srpm.rsplit("-", 2)
+    return parts[0] if len(parts) == 3 else srpm
+
+
+def kept_sources(packages):
+    """The source packages whose dependencies the node keeps as they are, and
+    why. Two ways to get there, both about the packages of one source requiring
+    each other at one exact version:
+
+    - the node holds one of them newer than the bundle, so handing rpm the rest
+      at the bundled version is a downgrade of the one or a broken pin on it
+    - the bundle would upgrade one of them, and the node holds another one of
+      the same source that the bundle does not carry: python3-nftables beside
+      nftables, device-mapper-event beside device-mapper. Nothing would move
+      that one along, and it pins the old version of what was upgraded
+
+    A package the release declares never keeps its source back"""
+    in_bundle = {}
     for p in packages:
-        if not p["principal"] and p["installed"] == NEWER:
-            kept_srpms.setdefault(p["srpm"], p)
+        in_bundle.setdefault(p["source"], set()).add(p["name"])
+
+    kept = {}
+    for p in packages:
+        if p["principal"] or p["source"] in kept:
+            continue
+        if p["installed"] == NEWER:
+            kept[p["source"]] = (f"the node holds {p['name']} {p['installed_evr']}, "
+                                 f"newer than the bundle")
+        elif p["installed"] == OLDER:
+            stranded = sorted(set(p.get("node_family") or []) - in_bundle[p["source"]])
+            if stranded:
+                kept[p["source"]] = (f"upgrading {p['name']} past {p['installed_evr']} would leave "
+                                     f"{', '.join(stranded)} of the node, which the bundle does not "
+                                     f"carry, pinned to the old version")
+    return kept
+
+
+def decide(packages):
+    """packages: dicts with file, name, evr, srpm, principal, installed (None,
+    SAME, NEWER or OLDER) with installed_evr, and node_family, the names the node
+    has installed from the same source package. Returns (action, file, reason) in
+    the order given, one per distinct file."""
+    for p in packages:
+        p.setdefault("source", source_name(p["srpm"]) or p["name"])
+    kept = kept_sources(packages)
 
     plan = []
     seen = set()
@@ -80,11 +132,8 @@ def decide(packages):
         elif p["installed"] == NEWER:
             plan.append((SKIP, p["file"],
                          f"the node holds {p['name']} {p['installed_evr']}, newer than {p['evr']}"))
-        elif p["srpm"] in kept_srpms:
-            holder = kept_srpms[p["srpm"]]
-            plan.append((SKIP, p["file"],
-                         f"built from {p['srpm']}, of which the node holds {holder['name']} "
-                         f"{holder['installed_evr']}, newer than the bundle"))
+        elif p["source"] in kept:
+            plan.append((SKIP, p["file"], f"source {p['source']} is kept: {kept[p['source']]}"))
         else:
             reason = "not installed" if p["installed"] is None else f"upgrades {p['installed_evr']}"
             plan.append((INSTALL, p["file"], reason))
@@ -117,6 +166,15 @@ def packages_from_rpm(args):
 
     principal_dirs = [os.path.realpath(d) for d in args.principal_dir]
     absent = set(args.assume_absent)
+
+    # What the node has installed, by the source package it was built from
+    installed_by_source = {}
+    for h in ts.dbMatch():
+        installed_name = text(h[rpm.RPMTAG_NAME])
+        source = source_name(text(h[rpm.RPMTAG_SOURCERPM]))
+        if source and installed_name not in absent:
+            installed_by_source.setdefault(source, set()).add(installed_name)
+
     packages = []
     for path in args.rpms:
         with open(path, "rb") as f:
@@ -147,15 +205,19 @@ def packages_from_rpm(args):
                     installed = NEWER if rpm.labelCompare(newest, evr) > 0 else OLDER
                     installed_evr = newest
 
+        srpm = text(header[rpm.RPMTAG_SOURCERPM]) or name
+        source = source_name(srpm) or name
         packages.append({
             "file": path,
             "name": name,
             "arch": arch,
             "evr": evr_string(evr),
-            "srpm": text(header[rpm.RPMTAG_SOURCERPM]) or name,
+            "srpm": srpm,
+            "source": source,
             "principal": principal,
             "installed": installed,
             "installed_evr": evr_string(installed_evr) if installed_evr else None,
+            "node_family": sorted(installed_by_source.get(source, ())),
         })
     return packages
 
@@ -170,6 +232,7 @@ def packages_from_facts(path):
         p.setdefault("installed", None)
         p.setdefault("installed_evr", None)
         p.setdefault("arch", "x86_64")
+        p.setdefault("node_family", [])
     return facts
 
 
