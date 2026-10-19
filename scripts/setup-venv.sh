@@ -74,6 +74,8 @@ parse_params "$@"
 
 # shellcheck source=all-node/linux-package/rpm-common.sh
 source "$SCRIPT_DIR_PATH/all-node/linux-package/rpm-common.sh"
+# shellcheck source=all-node/linux-package/deb-common.sh
+source "$SCRIPT_DIR_PATH/all-node/linux-package/deb-common.sh"
 
 UBUNTU2204_SUPPORTED_MINOR_VERSION=5
 UBUNTU2404_SUPPORTED_MINOR_VERSION=4
@@ -142,11 +144,12 @@ remove_venv_if_forced() {
 ubuntu2204_setup() {
   if [[ $(ubuntu2204_is_installed python3\.10-venv) = "false" ]]; then
     export DEBIAN_FRONTEND=noninteractive
-    dpkg -R -i "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu22.04/python3.10
-    dpkg -i "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu22.04/python3/python3-minimal*
-    dpkg -R -i "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu22.04/python3
-    dpkg -R -i "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu22.04/python3-distutils
-    dpkg -R -i "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu22.04/python3.10-venv
+    ubuntu_install_dir "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu22.04/python3.10
+    # python3-minimal before the rest of python3, which the others pre-depend on
+    deb_install_files python3-minimal -- "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu22.04/python3/python3-minimal*
+    ubuntu_install_dir "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu22.04/python3
+    ubuntu_install_dir "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu22.04/python3-distutils
+    ubuntu_install_dir "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu22.04/python3.10-venv
     export DEBIAN_FRONTEND=""
   fi
 
@@ -174,8 +177,8 @@ ubuntu2204_setup() {
 ubuntu2404_setup() {
   if [[ $(ubuntu2404_is_installed python3\.12-venv) = "false" ]]; then
     export DEBIAN_FRONTEND=noninteractive
-    dpkg -R -i "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu24.04/python3.12
-    dpkg -R -i "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu24.04/python3.12-venv
+    ubuntu_install_dir "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu24.04/python3.12
+    ubuntu_install_dir "$KI_OPT_BUNDLE_PATH"/linux-packages/ubuntu24.04/python3.12-venv
     export DEBIAN_FRONTEND=""
   fi
 
@@ -247,6 +250,20 @@ rhel9_setup() {
   rhel_install_dir "$KI_OPT_BUNDLE_PATH/linux-packages/rhel9/python3.12"
 
   rhel_create_venv
+
+  return 0
+}
+
+# Everything here is the dependency closure of python, so nothing is declared
+# by the release and every package is planned as a dependency
+ubuntu_install_dir() {
+  local dir=$1
+
+  local files=()
+  mapfile -t files < <(deb_files_of "$dir")
+  [[ ${#files[@]} = 0 ]] && return 0
+
+  deb_install_files "$(basename "$dir")" -- "${files[@]}"
 
   return 0
 }

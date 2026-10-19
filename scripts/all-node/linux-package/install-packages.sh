@@ -74,6 +74,8 @@ parse_params "$@"
 
 # shellcheck source=rpm-common.sh
 source "$SCRIPT_DIR_PATH/rpm-common.sh"
+# shellcheck source=deb-common.sh
+source "$SCRIPT_DIR_PATH/deb-common.sh"
 
 UBUNTU2204_SUPPORTED_MINOR_VERSION=5
 UBUNTU2404_SUPPORTED_MINOR_VERSION=4
@@ -95,6 +97,12 @@ k8s_packages_path=""
 # the bundled chrony replaces, and the container tools containerd.io conflicts
 # with
 RHEL_ERASED_PACKAGES=(systemd-timesyncd ntp chrony podman runc systemd-container)
+
+# What an ubuntu install removes before it lays the bundle down
+UBUNTU_REMOVED_PACKAGES=(systemd-timesyncd ntp chrony)
+
+# The directories of an ubuntu, in the order the dependencies between them want
+UBUNTU_DEB_DIRS=(nfs-common systemd dbus pigz slirp containerd iptables ebtables conntrack nftables docker nvidia-container-toolkit ethtool socat)
 
 # The arguments plan-rpm-install.py is given on this node: which packages are
 # the release's own and go in at their version whatever the node holds
@@ -147,6 +155,8 @@ ubuntu2204_install() {
   require_packages_installable
   set_k8s_packages_path ubuntu22.04
   require_declared_packages ubuntu22.04 deb
+  setup_deb_plan_args
+  ubuntu_require_installable ubuntu22.04
 
   begin_apt
 
@@ -180,6 +190,8 @@ ubuntu2404_install() {
   require_packages_installable
   set_k8s_packages_path ubuntu24.04
   require_declared_packages ubuntu24.04 deb
+  setup_deb_plan_args
+  ubuntu_require_installable ubuntu24.04
 
   begin_apt
 
@@ -456,32 +468,27 @@ list_bundled_packages() {
 # image of that ubuntu lacks for it (tools/build-bundle-packages.sh fills them),
 # and a principal the GA image already holds at the newest version has no
 # directory at all. Such a one is skipped here, since dpkg refuses a directory
-# with no deb in it. What is already there at the version the bundle holds is
-# handed over anyway: reinstalling it is a no-op to dpkg, unlike to rpm
+# with no deb in it.
+#
+# The GA image is the oldest point release, so a node of a later one holds much
+# of a directory newer. A dependency it holds newer it keeps, with the rest of
+# its source package, and a package the release declares goes in at its version
+# all the same (deb-common.sh). What is installed at the version the bundle
+# holds is not handed over either
 ubuntu_install_debs() {
   local os_dir=$1
 
   local base="$ki_opt_bundle_path/linux-packages/$os_dir"
 
-  ubuntu_install_deb_dir "$base"/nfs-common
-
-  ubuntu_install_deb_dir "$base"/systemd --force-confnew
-  ubuntu_install_deb_dir "$base"/dbus
-
-  ubuntu_install_deb_dir "$base"/pigz
-  ubuntu_install_deb_dir "$base"/slirp
-  ubuntu_install_deb_dir "$base"/containerd
-  ubuntu_install_deb_dir "$base"/iptables
-  ubuntu_install_deb_dir "$base"/ebtables
-  ubuntu_install_deb_dir "$base"/conntrack
-  ubuntu_install_deb_dir "$base"/nftables
-  ubuntu_install_deb_dir "$base"/docker
-
-  ubuntu_install_deb_dir "$base"/nvidia-container-toolkit
-
-  ubuntu_install_deb_dir "$base"/ethtool
-  ubuntu_install_deb_dir "$base"/socat
-  dpkg -R -i "$k8s_packages_path"
+  local dir
+  for dir in "${UBUNTU_DEB_DIRS[@]}"; do
+    if [[ $dir = "systemd" ]]; then
+      ubuntu_install_deb_dir "$base/$dir" --force-confnew
+    else
+      ubuntu_install_deb_dir "$base/$dir"
+    fi
+  done
+  ubuntu_install_deb_dir "$k8s_packages_path"
 
   return 0
 }
@@ -490,12 +497,51 @@ ubuntu_install_deb_dir() {
   local dir=$1
   shift
 
-  if ! compgen -G "$dir/*.deb" >/dev/null; then
+  local files=()
+  mapfile -t files < <(deb_files_of "$dir")
+  if [[ ${#files[@]} = 0 ]]; then
     msg "[INFO] Directory[\"$(basename "$dir")\"] holds no deb. nothing this os lacks for it"
     return 0
   fi
 
-  dpkg -R -i "$@" "$dir"
+  deb_install_files "$(basename "$dir")" "$@" -- "${files[@]}"
+
+  return 0
+}
+
+# The packages release.yml declares, and the packages of kubernetes, go in at
+# their version whatever the node holds
+setup_deb_plan_args() {
+  deb_principal_dirs=("$k8s_packages_path")
+  deb_principals=()
+
+  local name
+  while read -r name; do
+    [[ -n $name ]] && deb_principals+=("$name")
+  done < <($yq_cmd '.ki_release_packages // {} | keys | .[]' < "$vars_path")
+
+  return 0
+}
+
+# Refuses the node before anything is removed, if the plan would break or take
+# away a package of it
+ubuntu_require_installable() {
+  local os_dir=$1
+
+  local base="$ki_opt_bundle_path/linux-packages/$os_dir"
+  local files=()
+  local dir
+  local file
+  for dir in "${UBUNTU_DEB_DIRS[@]}"; do
+    while read -r file; do
+      [[ -n $file ]] && files+=("$file")
+    done < <(deb_files_of "$base/$dir")
+  done
+  while read -r file; do
+    [[ -n $file ]] && files+=("$file")
+  done < <(deb_files_of "$k8s_packages_path")
+
+  deb_require_installable "${UBUNTU_REMOVED_PACKAGES[@]}" -- "${files[@]}"
 
   return 0
 }
