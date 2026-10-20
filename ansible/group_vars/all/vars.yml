@@ -1,3 +1,13 @@
+# The user ansible logs in to every node as, the control node included. root
+# works as it always has. Any other user has to exist on every node under this
+# one name, hold the public key configure-control-node-ssh.sh prints, and be
+# allowed sudo without a password - the playbooks run every script through sudo
+# and nothing is there to type one. The user ends up with what root has, so this
+# is for sites whose policy forbids logging in as root rather than for giving the
+# installer less. To log in to one node as someone else, set it on that node in
+# inventory.yml
+ansible_user: root
+
 ki_var_root_path: "/var/lib/k8s-installer"
 docker_root_path: "/var/lib/docker"
 
@@ -80,6 +90,23 @@ internal_network_subnets:
 
 ki_cp_ha_mode: true
 ki_cp_ha_mode_vip: null
+# Who tells the network where the vip is.
+#
+# arp is a node announcing the address itself, with gratuitous arp, as soon as
+# keepalived puts it on an interface. That is what a switch listens to and what
+# a cloud ignores: a vpc delivers to the addresses it has on record for a
+# network interface and to nothing else, so on ec2 the vip goes up on a node and
+# no packet ever arrives.
+#
+# aws-eni is for ec2. The node keepalived makes MASTER takes the vip onto its
+# own network interface as a secondary private address, through the ec2 api,
+# and the node it was on loses it in the same call. Everything else - who is
+# elected, when the address moves, that a node which came back does not take
+# it back - is the keepalived above either way. What it needs from the site is
+# in README.adoc: an instance profile allowing ec2:AssignPrivateIpAddresses on
+# every ki cp node, a way to reach the ec2 api, and the vip kept free in the
+# subnet of the ki cp nodes
+ki_cp_ha_mode_vip_carrier: "arp"
 # The time zone the ki cp services render their timestamps in. Null takes the
 # zone of the node each one runs on, which is what makes the log of a container
 # read like the journal of the machine it is on.
@@ -99,6 +126,16 @@ ki_cp_dns_server_upstream_servers:
 ki_cp_ntp_server_upstream_servers:
   - "time1.google.com"
   - "time2.google.com"
+# Whether the ntp server of a ki cp node hands out its own clock when none of
+# the upstream servers above can be reached. On, the nodes keep following the
+# ki cp through an outage of its upstream, agreeing with one another on a time
+# that is only as right as its clock, and go back to the upstream when it
+# returns. Off, a ki cp whose upstream is gone hands out nothing, the nodes
+# stop synchronising and the clock check of check-node-state.sh refuses every
+# playbook, which is the choice of a site that would rather stop than run on a
+# clock nothing checks. An empty list above is the ki cp clock as the only time
+# there is, whatever this says. See README.adoc
+ki_cp_ntp_server_local_fallback: true
 
 # The addresses kubernetes hands out inside the cluster. Fixed while a cluster
 # exists: the service subnet decides the address of every service, including the
@@ -117,6 +154,24 @@ ki_cp_ntp_server_upstream_servers:
 # reach Ready, and the reason does not show up where the symptom does
 k8s_pod_subnet: "10.244.0.0/16"
 k8s_service_subnet: "10.96.0.0/12"
+
+# Whether kubeadm installs kube-proxy. Set to false for a cni that routes the
+# services itself - cilium with kubeProxyReplacement, calico in ebpf mode - and
+# kubeadm makes no kube-proxy DaemonSet, now or at any upgrade after. Nothing
+# else here changes: the cni is still what brings the pod network up, and until
+# it does no service address is reachable, kube-proxy or not.
+#
+# A cni that replaces kube-proxy has to be told where the apiserver is, since
+# the kubernetes service address it would otherwise use is one of the addresses
+# it is now in charge of routing. The address to give it is the one every
+# kubelet already uses, ki-cp.<internal_network_zone>:<ki_cp_k8s_cp_lb_port>,
+# which is ki-cp.ki.local:16443 unless constant-vars.yml says otherwise.
+#
+# Fixed while a cluster exists, like the subnets: taking kube-proxy out of a
+# running cluster is a DaemonSet deleted and the rules it wrote cleaned off
+# every node, and putting it back is an addon phase run again, and neither is
+# what update-cluster.yml does. It refuses the change instead
+k8s_kube_proxy_enabled: true
 
 # The kubernetes minor this cluster runs. It has to be one the release carries:
 # release.yml lists them under k8s_versions, and the patch of that minor is the

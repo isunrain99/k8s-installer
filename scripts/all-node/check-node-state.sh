@@ -90,6 +90,8 @@ provision_reboot=""
 target_node=""
 target_node_op=""
 ki_cp_ha_mode=""
+ki_cp_ha_mode_vip=""
+ki_cp_ha_mode_vip_carrier=""
 
 ki_var_root_path=""
 docker_root_path=""
@@ -127,6 +129,8 @@ main() {
   target_node=$($yq_cmd '.target_node' < "$vars_path")
   target_node_op=$($yq_cmd '.target_node_op' < "$vars_path")
   ki_cp_ha_mode=$($yq_cmd '.ki_cp_ha_mode' < "$vars_path")
+  ki_cp_ha_mode_vip=$($yq_cmd '.ki_cp_ha_mode_vip' < "$vars_path")
+  ki_cp_ha_mode_vip_carrier=$($yq_cmd '.ki_cp_ha_mode_vip_carrier' < "$vars_path")
   hostname_to_ih_dict=$($yq_cmd -o json '.hostname_to_ih_dict' < "$vars_path")
 
   ki_var_root_path=$($yq_cmd '.ki_var_root_path' < "$vars_path")
@@ -147,7 +151,9 @@ main() {
   # not name either of them
   check_disk_space "$(get_node_check_severity)"
   check_clock "$(get_node_check_severity)"
+  check_time_source "$(get_node_check_severity)"
   check_kernel_modules "$(get_node_check_severity)"
+  check_vip_carrier "$(get_node_check_severity)"
   require_no_etcd_alarm
 
   if [[ $playbook = "setup-cluster" ]]; then
@@ -372,6 +378,45 @@ check_kernel_modules() {
   return 0
 }
 
+# Whether this node can carry the vip the way the site says it is carried.
+# Everything the carrier would need at a handover - on ec2 the instance
+# metadata, a network interface holding the address of this node, a subnet that
+# can hold the vip, an instance profile allowed to assign it, a route to the
+# api - is asked of it without moving anything, and what is missing comes back
+# in its words. Which carrier it is, and whether it has anything to ask, is the
+# carrier's to know: arp asks nothing, because a switch needs no permission.
+#
+# Asked of a ki cp node that is being built or kept, and not of one that is on
+# its way out: a node remove-node is taking away is never MASTER again, and a
+# cluster being reset or rescued has nothing to gain from an answer
+check_vip_carrier() {
+  local severity=$1
+
+  [[ $ki_cp_ha_mode = "true" ]] || return 0
+  [[ $(is_ki_cp_node "$inventory_hostname") = "true" ]] || return 0
+  [[ $inventory_hostname = "$target_node" && $target_node_op = "remove" ]] && return 0
+  case "$playbook" in
+    reset-cluster | remove-node | remove-broken-node) return 0 ;;
+  esac
+
+  # The address of this node and not the vip, which is on the same interface
+  # whenever this node holds it and would name the interface just as well
+  # until the moment it does not
+  local node_ip
+  node_ip=$($yq_cmd "[.internal_network_interfaces[] | select(.ip != \"$ki_cp_ha_mode_vip\")][0].ip" < "$vars_path")
+
+  local output
+  local exit_code=0
+  output=$("$ki_opt_venv_path"/bin/python3 "$ki_opt_scripts_path"/ki-cp-node/keepalived/carry-vip.py \
+    --carrier "$ki_cp_ha_mode_vip_carrier" preflight --vip "$ki_cp_ha_mode_vip" --node-ip "$node_ip" 2>&1) || exit_code=$?
+  [[ $exit_code = 0 ]] && return 0
+
+  report_or_die "$severity" \
+    "This node can not carry vip[\"$ki_cp_ha_mode_vip\"] with carrier[\"$ki_cp_ha_mode_vip_carrier\"], which ki_cp_ha_mode_vip_carrier says it has to:\n$output\nWhat the carrier needs from the site is in README.adoc"
+
+  return 0
+}
+
 get_os_distribution() {
   grep -oP '^ID="?\K\w+(?="?$)' /etc/os-release
 
@@ -433,6 +478,78 @@ check_clock() {
 # above has already answered whether the clock is being disciplined at all. The
 # caller takes anything that is not a number as that same silence, which is what
 # a daemon that is installed but not running comes back as
+# A ki cp node must not follow its own ntp server. That server is a container
+# whose chronyd measures the clock of this very node against the upstream and
+# hands out the corrected time without being allowed to apply it, so a time
+# daemon on the node that steers the clock by what the container says closes a
+# loop in which each one's correction is the other's error: measured as the
+# container learning -471 ppm and timesyncd pinned at its +500 ppm limit while
+# the upstream answered, and 11 seconds off in 25 minutes once it did not.
+# setup-ntp-client.sh points a ki cp node at the upstream instead; this is
+# what says so when something else pointed it back, and it reads the symptom
+# as well as the cause, since a loop that was closed and opened again leaves
+# the frequency where it was until the daemon has relearned it
+check_time_source() {
+  local severity=$1
+
+  local is_ki_cp
+  is_ki_cp=$($yq_cmd '.group_names | contains(["ki_cp_node"])' < "$vars_path")
+  [[ $is_ki_cp = "true" ]] || return 0
+
+  local ki_cp_dns_name upstream_len
+  ki_cp_dns_name=$($yq_cmd '.internal_network_ki_cp_dns_name' < "$vars_path")
+  upstream_len=$($yq_cmd '.ki_cp_ntp_server_upstream_servers | length' < "$vars_path")
+
+  # With no upstream the ntp server measures nothing and hands out this node's
+  # clock as it is, which is the one case following it does not loop, and the
+  # case setup-ntp-client.sh does point the node at it
+  local sources
+  sources=$(get_time_sources)
+  if [[ $upstream_len -gt 0 ]] && grep -qxF "$ki_cp_dns_name" <<< "$sources"; then
+    report_or_die "$severity" \
+      "The time daemon of this node follows \"$ki_cp_dns_name\", the ntp server this node itself runs. That server measures this node's clock and hands out the correction without applying it, so following it steers the clock by its own correction and the two run away from each other. A ki cp node follows ki_cp_ntp_server_upstream_servers directly, which setup-ntp-client.sh writes; run it, or update-cluster.yml, before going on"
+    return 0
+  fi
+
+  local frequency_ppm
+  frequency_ppm=$(get_clock_frequency_ppm)
+  [[ $frequency_ppm =~ ^[-+]?[0-9]+(\.[0-9]+)?$ ]] || return 0
+  local pinned
+  pinned=$(awk -v f="$frequency_ppm" 'BEGIN { if (f < 0) f = -f; print (f >= 400) ? "true" : "false" }')
+  [[ $pinned = "true" ]] || return 0
+
+  report_or_die "$severity" \
+    "The time daemon of this node is correcting its clock by ${frequency_ppm} ppm, which is the limit a daemon sits at when it has been following a clock that follows it, not a rate a machine's clock is wrong by. Check what this node and the ntp server on it follow, and give the daemon time to relearn after it is put right"
+
+  return 0
+}
+
+# The servers the time daemon of this node is configured with, one per line
+get_time_sources() {
+  if [[ $(has_command chronyc) = "true" ]]; then
+    awk '$1 == "server" || $1 == "pool" || $1 == "peer" { print $2 }' /etc/chrony.conf /etc/chrony.d/*.conf 2>/dev/null
+    return 0
+  fi
+
+  awk -F= '$1 == "NTP" || $1 == "FallbackNTP" { n = split($2, s, " "); for (i = 1; i <= n; i++) print s[i] }' /etc/systemd/timesyncd.conf 2>/dev/null
+
+  return 0
+}
+
+# The frequency correction the time daemon applies, in ppm, signed
+get_clock_frequency_ppm() {
+  if [[ $(has_command chronyc) = "true" ]]; then
+    # Field 8 of the csv is the frequency in ppm, positive when the clock is
+    # fast
+    chronyc -c tracking 2>/dev/null | cut -d, -f8
+    return 0
+  fi
+
+  timedatectl timesync-status 2>/dev/null | grep -E "^ *Frequency: " | sed -E 's/^ *Frequency: *([-+]?[0-9.]+)ppm.*/\1/'
+
+  return 0
+}
+
 get_clock_offset_seconds() {
   if [[ $(has_command chronyc) = "true" ]]; then
     # Field 5 of the csv is the offset in seconds, signed, as chrony last

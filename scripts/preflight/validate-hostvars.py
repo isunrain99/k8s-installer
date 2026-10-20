@@ -103,6 +103,9 @@ KUBEADM_CONTROL_PLANE_VOLUME_NAMES = frozenset({
 VFIO_PCI_OWNED_KERNEL_ARGS = frozenset({"intel_iommu", "amd_iommu", "iommu", "vfio-pci.ids"})
 
 
+# A user name as useradd accepts one, with the trailing $ of a machine account
+USER_NAME_PATTERN = r"^[a-z_]([a-z0-9_-]{0,31}|[a-z0-9_-]{0,30}\$)$"
+
 # The kernel reads a hugepages= as belonging to the hugepagesz= before it, so a
 # node asking for two page sizes repeats both names on purpose and the order of
 # the list is what carries the meaning. Every other argument is taken once
@@ -112,7 +115,7 @@ POSITIONAL_KERNEL_ARGS = frozenset({"hugepagesz", "hugepages"})
 # in vars.yml. ki_var_classes covers both files, so a name in it is a name the
 # inventory may carry too, and these are the ones where that would be accepted
 # and then not mean anything
-CLUSTER_WIDE_VARS = frozenset({"kubelet_server_tls_bootstrap"})
+CLUSTER_WIDE_VARS = frozenset({"k8s_kube_proxy_enabled", "kubelet_server_tls_bootstrap"})
 
 
 def main():
@@ -179,9 +182,12 @@ def validate_var_classes(hostvars_errors: List[HostvarsError], hostvars):
     classified = {name for names in var_classes.values() for name in names}
     removed = lo_hostvars.get("ki_removed_vars") or {}
 
+    # The ansible_ names configure the connection rather than the cluster, and
+    # nothing here applies them. vars.yml carries the user to log in as, and
+    # inventory.yml carries that and the address and port of each node
     user_vars_path = Path(ansible_path) / "group_vars" / "all" / "vars.yml"
     for var_name, value in sorted(read_yaml_mapping(user_vars_path).items()):
-        if var_name in classified:
+        if var_name in classified or var_name.startswith("ansible_"):
             continue
         if var_name in removed:
             hostvars_errors.append(
@@ -192,8 +198,7 @@ def validate_var_classes(hostvars_errors: List[HostvarsError], hostvars):
 
     # inventory.yml is read as a file too. hostvars carries hundreds of names
     # ansible itself defines, so what a node was actually given can only be seen
-    # in the file it was given in. The ansible_ ones configure the connection
-    # rather than the cluster, and nothing here applies them
+    # in the file it was given in
     inventory_path = Path(ansible_path) / "inventory.yml"
     for var_name, value in sorted(read_inventory_host_vars(inventory_path).items()):
         if var_name in classified or var_name.startswith("ansible_"):
@@ -389,6 +394,18 @@ def validate_ki_cp_ha_mode_vip(hostvars_errors: List[HostvarsError], hostvars):
                               ("ki_cp_ha_mode_vip",),
                               str(ki_cp_ha_mode_vip),
                               "Variable[\"ki_cp_ha_mode_vip\"] must be set when value for variable[\"ki_cp_ha_mode\"] is true")
+        hostvars_errors.append(error)
+
+    # A carrier is how a vip reaches the network, and a cluster without one has
+    # nothing for it to carry. Refused rather than ignored, because a site that
+    # wrote aws-eni expects the address to move and would find out that it does
+    # not the first time a ki cp node is lost
+    ki_cp_ha_mode_vip_carrier = lo_hostvars.get("ki_cp_ha_mode_vip_carrier", "arp")
+    if not ki_cp_ha_mode and ki_cp_ha_mode_vip_carrier != "arp":
+        error = HostvarsError("localhost",
+                              ("ki_cp_ha_mode_vip_carrier",),
+                              str(ki_cp_ha_mode_vip_carrier),
+                              "Variable[\"ki_cp_ha_mode_vip_carrier\"] can only be set when value for variable[\"ki_cp_ha_mode\"] is true. There is no vip to carry without it")
         hostvars_errors.append(error)
 
 
@@ -1197,6 +1214,11 @@ class VarsModel(BaseModel):
 
     ki_cp_ha_mode: bool
     ki_cp_ha_mode_vip: Optional[IPv4Address] = None
+    # Who tells the network where the vip is: the node itself with gratuitous
+    # arp, or the ec2 api moving it between network interfaces. Defaulted here
+    # as well as in constant-vars.yml, for the vars files of the tests that
+    # predate the line
+    ki_cp_ha_mode_vip_carrier: Literal["arp", "aws-eni"] = "arp"
     # None takes the zone of the node the service runs on
     ki_cp_service_timezone: Optional[
         Annotated[str, StringConstraints(pattern=TIMEZONE_PATTERN)]] = None
@@ -1211,9 +1233,14 @@ class VarsModel(BaseModel):
             Field(union_mode='left_to_right')
         ]
     ]
+    ki_cp_ntp_server_local_fallback: bool
 
     k8s_pod_subnet: IPv4Network
     k8s_service_subnet: IPv4Network
+    # Cluster wide: the ClusterConfiguration it is rendered into is the one of
+    # the node that ran kubeadm init. validate_cluster_wide_vars keeps it out of
+    # inventory.yml
+    k8s_kube_proxy_enabled: bool
     k8s_minor_version: Annotated[str, StringConstraints(pattern=K8S_MINOR_VERSION_PATTERN)]
     k8s_certificate_validity_period: Annotated[str, StringConstraints(pattern=VALIDITY_PERIOD_PATTERN)]
 
@@ -1343,7 +1370,13 @@ class ConstantVarsModel(BaseModel):
 
     ansible_python_interpreter: Path
     ansible_port: int = Field(ge=0, le=65535)
-    ansible_ssh_user: Annotated[str, StringConstraints(pattern=r"^[a-z_]([a-z0-9_-]{0,31}|[a-z0-9_-]{0,30}\$)$")]
+    # The user to log in as may be left unset, in which case ansible logs in as
+    # the user running it; ki_ssh_user is that choice resolved, and is what the
+    # plays that spell a user@host pair use, so it is the one that has to be a
+    # user name
+    ansible_user: Optional[
+        Annotated[str, StringConstraints(pattern=USER_NAME_PATTERN)]] = None
+    ki_ssh_user: Annotated[str, StringConstraints(pattern=USER_NAME_PATTERN)]
 
     ki_opt_root_path: Path
     ki_opt_scripts_path: Path

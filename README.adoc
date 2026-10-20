@@ -188,6 +188,16 @@ control_node:
 
 === 클러스터 설치
 
+플레이북은 `ansible-playbook` 을 실행한 사용자로 모든 노드에 SSH 로 들어가고 (제어 노드 자신도
+포함합니다), 노드에서 하는 일은 전부 `sudo` 로 합니다. 어느 사용자로 들어갈지는 `vars.yml` 의
+`ansible_user` 가 정하고 기본값은 `root` 입니다. root 로그인을 금지하는 사이트는 다른 사용자를
+적으면 되는데, 그 사용자는 **모든 노드에 같은 이름으로 있고 비밀번호 없이 `sudo` 를 쓸 수 있어야**
+합니다 (`NOPASSWD`). 비밀번호를 받아 줄 자리가 없기 때문이고, 플레이북은 첫 태스크에서 `sudo -n true`
+로 이것을 확인한 뒤 안 되는 노드를 거부합니다. root 에 키를 만들거나 등록할 일은 없습니다. 다만 그
+사용자는 결국 root 가 하는 모든 일을 하므로, 이것은 설치본의 권한을 줄이는 것이 아니라 누가 들어왔는지를
+sudo 로그에 남기고 정책을 따르는 것입니다. SSH 설정 스크립트는 **그 사용자로** 실행합니다 — 키는 실행한
+사용자의 홈에 생기고, 출력되는 안내도 그 사용자의 `authorized_keys` 를 가리킵니다.
+
 [source,shell,subs="+attributes"]
 ----
 git clone {github}.git
@@ -196,10 +206,10 @@ git checkout v{version}
 ./download-bundle.sh
 sudo ./setup.sh
 
-sudo /opt/k8s-installer/ansible/configure-control-node-ssh.sh   # 출력된 안내에 따라 모든 관리 노드에 SSH 설정
+/opt/k8s-installer/ansible/configure-control-node-ssh.sh   # ansible 을 실행할 사용자로. 출력된 안내에 따라 모든 관리 노드에 SSH 설정
 
 # /opt/k8s-installer/ansible/inventory.yml 과
-# /opt/k8s-installer/ansible/group_vars/all/vars.yml 수정
+# /opt/k8s-installer/ansible/group_vars/all/vars.yml 수정 (setup.sh 가 root 로 놓은 파일이라 sudo 로 편집)
 
 source /opt/k8s-installer/venv/bin/activate
 cd /opt/k8s-installer/ansible
@@ -509,6 +519,118 @@ k8s_service_subnet: "10.96.0.0/12"
 ====
 
 두 줄 다 있어야 합니다. 지우면 기본값으로 떨어지지 않고 플레이북이 시작 전에 멈춥니다.
+
+=== kube-proxy 없이 세우기
+
+kubeadm 은 기본으로 kube-proxy 를 DaemonSet 으로 올립니다. cilium 의 kubeProxyReplacement 나
+calico 의 eBPF 모드처럼 서비스 라우팅을 CNI 가 맡는 사이트는 `vars.yml` 에서 끄고 세웁니다.
+끄면 kubeadm 이 처음 세울 때도, 그 뒤 업그레이드할 때도 kube-proxy 를 만들지 않습니다.
+
+[source,yaml]
+----
+k8s_kube_proxy_enabled: false
+----
+
+[IMPORTANT]
+====
+* *서 있는 클러스터에서는 바꿀 수 없습니다.* kube-proxy 를 빼는 것은 DaemonSet 을 지우고 그것이
+  쓴 규칙을 모든 노드에서 걷어 내는 일이고, 넣는 것은 kubeadm 의 addon 단계를 다시 돌리는
+  일입니다. `update-cluster.yml` 이 거부합니다
+* *CNI 에 apiserver 주소를 직접 줘야 합니다.* kube-proxy 가 없으면 `kubernetes` 서비스의
+  ClusterIP 는 그 CNI 가 뜨기 전까지 아무 데로도 가지 않는데, CNI 가 바로 그 주소로 apiserver 를
+  찾으면 영영 뜨지 못합니다. 줄 주소는 모든 kubelet 이 쓰는 것과 같은 `ki-cp.ki.local` 과
+  `16443` 입니다. cilium 이면 `k8sServiceHost` 와 `k8sServicePort` 가 그 자리입니다
+* 노드별로는 못 씁니다. 클러스터 하나에 하나인 값이라 `inventory.yml` 에 적으면 플레이북이 시작
+  전에 멈춥니다
+====
+
+줄이 없으면 `true` 입니다. 이 줄이 생기기 전에 세운 클러스터는 전부 kube-proxy 가 있는
+클러스터이고, 설치본을 올려도 그대로입니다. 설계 판단은 link:docs/impl-notes.adoc[구현 노트]에
+있습니다.
+
+=== EC2 에서 HA 모드
+
+keepalived 는 VIP 를 인터페이스에 올리고 gratuitous ARP 로 이웃에게 알립니다. 스위치는 그것을
+듣지만 VPC 는 듣지 않습니다 — VPC 는 네트워크 인터페이스에 등록된 주소로만 패킷을 보냅니다.
+그래서 EC2 에서는 VIP 가 노드에 올라가도 아무것도 도착하지 않았고, `ki_cp_ha_mode: false` 로만
+쓸 수 있었습니다.
+
+`ki_cp_ha_mode_vip_carrier` 가 그 빈 자리를 채웁니다. 누가 VIP 를 망에 알리는가입니다.
+
+[source,yaml]
+----
+ki_cp_ha_mode: true
+ki_cp_ha_mode_vip: "172.31.50.10"
+ki_cp_ha_mode_vip_carrier: "aws-eni"   # 기본값 arp
+----
+
+`aws-eni` 이면 MASTER 가 된 노드가 EC2 API(`AssignPrivateIpAddresses`) 로 VIP 를 자기
+네트워크 인터페이스의 **보조 사설 IP** 로 가져옵니다. 전에 들고 있던 인터페이스에서는 같은 호출로
+떨어집니다. 선출·헬스체크·`nopreempt` 는 온프렘과 같은 keepalived 그대로이고, 달라지는 것은
+주소를 가져오는 손 하나입니다. 호출은 컨테이너가 아니라 호스트의 systemd 유닛(`ki-cp-vip-carrier`)
+이 인스턴스 프로파일의 자격증명으로 합니다. `arp` 는 지금까지와 같고, 줄을 안 적으면 `arp` 입니다.
+
+값은 클라우드가 아니라 **주소를 나르는 방식** 의 이름입니다. 한 클라우드에 방식이 둘일 수 있고, 어떤
+클라우드는 한 번 설정해 두면 `arp` 가 그대로 되기 때문입니다. 다른 클라우드를 붙이는 것은
+`scripts/ki-cp-node/keepalived/carriers/` 에 모듈 하나를 더하는 일이고, keepalived 와 유닛과
+메트릭은 어느 캐리어인지 모릅니다. 계약은 link:docs/impl-notes.adoc[구현 노트]에 있습니다.
+
+==== 사이트가 준비할 것
+
+. *인스턴스 프로파일.* ki cp 노드 전부에, `ec2:AssignPrivateIpAddresses` 를 허용하는 역할.
+  리소스는 그 서브넷의 네트워크 인터페이스로 좁힐 수 있습니다
+  (`"Condition": {"StringEquals": {"ec2:Subnet": "arn:aws:ec2:<region>:<account>:subnet/<subnet-id>"}}`).
+. *VIP.* ki cp 노드 서브넷의 비어 있는 주소. AWS 가 다른 인스턴스에 주지 못하게
+  `aws ec2 create-subnet-cidr-reservation --subnet-id <id> --reservation-type explicit --cidr <vip>/32`
+  로 잡아 두거나, 첫 ki cp 노드의 인터페이스에 미리 assign 해 둡니다(`/32` 예약을 거부하는
+  리전이면 이쪽). 서브넷의 처음 넷과 마지막 하나는 AWS 가 쓰므로 고를 수 없습니다
+. *보안 그룹.* ki cp 노드끼리 자기 보안 그룹을 소스로 all-traffic. VRRP(프로토콜 112)가 막히면
+  둘 다 MASTER 가 되어 주소를 번갈아 가져갑니다 — 아래 메트릭이 그것을 잡습니다
+. *EC2 API 가는 길.* NAT 게이트웨이, 또는 VPC 의 `com.amazonaws.<region>.ec2` 인터페이스
+  엔드포인트(Private DNS 켬). 엔드포인트의 이름은 VPC 리졸버만 풀므로 그때는
+  `ki_cp_dns_server_upstream_servers: ["169.254.169.253"]` 로 둡니다. S3 번들과 RHUI 저장소도
+  그 리졸버를 거쳐야 합니다
+. *시간.* 외부 NTP 가 막힌 VPC 에서는 `ki_cp_ntp_server_upstream_servers: ["169.254.169.123"]`
+  (Amazon Time Sync). 시계가 안 맞으면 플레이북이 시작 전에 멈춥니다
+. *한 서브넷.* ki cp 노드는 같은 서브넷(같은 AZ)이어야 합니다. 보조 사설 IP 는 그 인터페이스의
+  서브넷 안에서만 옮겨 다닙니다. k8s 워커는 다른 서브넷이어도 됩니다
+
+호스트 이름은 준비할 것이 없습니다. EC2 의 `ip-172-31-…` 는 VPC 리졸버만 풀어 주는 이름이라
+설치본이 `resolv.conf` 를 가져가면 사라지는데, 설치본이 그때 그 노드의 이름을 `/etc/hosts` 에
+같이 적어 둡니다. 없으면 sudo 가 부를 때마다 `unable to resolve host` 를 찍습니다.
+
+플레이북이 시작 전에 이 중 넷을 노드마다 묻습니다 — 인스턴스 메타데이터가 답하는가, VIP 가 이
+인터페이스의 서브넷 안인가, 인스턴스 프로파일이 있는가, 그리고 `DryRun` 으로
+`AssignPrivateIpAddresses` 를 불러 권한과 API 까지의 길이 있는가. 걸리면 무엇이 빠졌는지 적고
+아무것도 건드리지 않고 멈춥니다.
+
+==== 동작
+
+* 페일오버는 온프렘과 같이 30초(`fall 10` × 3초) 뒤에 시작하고, API 호출과 VPC 반영에 몇 초가
+  더 듭니다. 돌아온 노드는 VIP 를 되찾지 않습니다. EC2 에서 잰 값은 로드밸런서가 멈춘 뒤
+  apiserver 가 VIP 로 다시 답하기까지 **51초** 였습니다 — 전이까지 29초, API 호출과 메타데이터
+  반영 7초, 그리고 묻던 노드의 ARP 캐시가 옛 MAC 을 버리기까지 15초. 마지막 것은 VPC 가 GARP 를
+  버리기 때문에 keepalived 가 줄여 줄 수 없는 몫이고, VIP 를 캐시에 들고 있던 노드에서만 생깁니다.
+  Ubuntu 22.04 4노드와 RHEL 8.10·9.8·10.2 를 섞은 3노드에서 같은 경로를 돌려 확인했습니다
+* 호출이 실패하면 — API 에 못 닿거나, 권한이 없거나 — 그 실행은 실패로 끝나고(`systemctl --failed`
+  에 보이고 이유는 `journalctl -u ki-cp-vip-carrier` 에 있습니다), 15초 타이머가 노드가 MASTER 인
+  동안 다시 부릅니다. 그동안 VIP 는 인터페이스에는 있지만 VPC 가 보내지 않습니다
+* 전이 없이 어긋나면 — 콘솔에서 주소를 옮겼거나, 전이 순간에 API 가 죽어 있었으면 — 같은 타이머가
+  알아차립니다. 다만 **전이가 아닌데 남이 들고 있는 주소는 60초 동안 떨어져 있을 때만** 가져옵니다.
+  VRRP 가 막혀 둘 다 MASTER 라고 믿는 분리뇌에서 주소가 몇 초마다가 아니라 분 단위로 오가게 하려는
+  것이고, 그 사이 아래 메트릭이 그것을 말합니다
+* 주소를 **떼는 호출은 없습니다.** 다음 MASTER 가 가져가면서 떨어집니다. BACKUP 이 스스로
+  떼게 하면 MASTER 가 둘인 순간에 서로의 것을 떼는 꼴이 됩니다. 그래서 `ki_cp_ha_mode_vip` 를
+  바꾸면 옛 주소는 마지막으로 들고 있던 인터페이스에 보조 IP 로 남습니다 — 콘솔에서 떼면 됩니다
+
+[IMPORTANT]
+====
+`ki_cp_ha_mode` 처럼 서 있는 클러스터에서 끄고 켤 수 없는 값이 아닙니다. `arp` 와 `aws-eni`
+사이는 keepalived 를 다시 렌더하는 것뿐이라 `update-cluster.yml` 이 적용합니다. 다만 `aws-eni`
+는 `ki_cp_ha_mode: true` 와만 짝이 됩니다 — 옮길 VIP 가 없는 클러스터에서는 거부합니다.
+====
+
+설계 판단은 link:docs/impl-notes.adoc[구현 노트]에 있습니다.
 
 === 노드 라벨과 테인트
 
@@ -1134,8 +1256,8 @@ WARNING: 복구는 클러스터의 상태를 스냅샷 시점으로 되돌립니
 
 [source,shell]
 ----
-# 스냅샷을 제어 노드로 가져옵니다
-scp root@<노드>:/var/lib/k8s-installer/etcd-backups/etcd-<타임스탬프>.db /tmp/
+# 스냅샷을 제어 노드로 가져옵니다. 백업 디렉토리는 root 의 것이라 sudo 로 읽습니다
+ssh <노드> sudo cat /var/lib/k8s-installer/etcd-backups/etcd-<타임스탬프>.db > /tmp/etcd-<타임스탬프>.db
 
 source /opt/k8s-installer/venv/bin/activate
 cd /opt/k8s-installer/ansible
@@ -1382,14 +1504,15 @@ sha256sum bundle-1.36.1.tgz
 옮기는 것은 그 선언 한 줄과 SSH 키뿐입니다. `ki_cp_node` 는 모두 같은 `ansible` 디렉토리를
 들고 있으므로 옮겨 갈 노드에 이미 필요한 것이 다 있습니다.
 
-인계받을 `ki_cp_node`에서 `control_node_ih`를 그 노드로 바꾸고, 그 노드의 SSH 키를 관리 노드에 심으면 됩니다.
-SSH 설정 스크립트는 ansible 디렉토리에 함께 동기화되므로 소스 트리를 다시 받을 필요가 없습니다.
+인계받을 `ki_cp_node`에서 `control_node_ih`를 그 노드로 바꾸고, 그 노드에서 ansible 을 실행할 사용자의
+SSH 키를 관리 노드에 심으면 됩니다. SSH 설정 스크립트는 ansible 디렉토리에 함께 동기화되므로 소스
+트리를 다시 받을 필요가 없습니다.
 
 [source,shell]
 ----
 # 인계받을 ki_cp_node 에서
-vi /opt/k8s-installer/ansible/inventory.yml    # control_node_ih: node2
-sudo /opt/k8s-installer/ansible/configure-control-node-ssh.sh   # 출력된 안내에 따라 모든 관리 노드에 SSH 설정
+sudo vi /opt/k8s-installer/ansible/inventory.yml    # control_node_ih: node2
+/opt/k8s-installer/ansible/configure-control-node-ssh.sh   # ansible 을 실행할 사용자로. 출력된 안내에 따라 모든 관리 노드에 SSH 설정
 ----
 
 선언이 실제로 플레이북을 실행하는 노드를 가리키지 않으면 모든 플레이북이 시작 단계에서 중단됩니다.
@@ -1454,7 +1577,7 @@ ansible-playbook -i inventory.yml playbooks/reset-cluster.yml
 ansible-playbook -i inventory.yml playbooks/reset-k8s-installer.yml
 deactivate
 
-sudo /opt/k8s-installer/ansible/reset-control-node-ssh.sh   # 출력된 안내에 따라 모든 관리 노드의 SSH 설정 제거
+/opt/k8s-installer/ansible/reset-control-node-ssh.sh   # SSH 설정 스크립트를 실행한 사용자로. 출력된 안내에 따라 모든 관리 노드의 SSH 설정 제거
 sudo /opt/k8s-installer/reset.sh
 ----
 
@@ -1477,6 +1600,10 @@ ansible-playbook -i inventory.yml playbooks/reset-cluster.yml -e sdfc=
 apiserver 가 돌아온 뒤 `kubectl delete node` 로 직접 빼야 합니다.
 
 == 플레이북이 시작 전에 보는 것
+
+모든 플레이북은 제어 노드에서, `setup-k8s-installer` 는 모든 노드에서 `sudo -n true` 로 비밀번호 없는
+`sudo` 가 되는지를 가장 먼저 봅니다. 안 되는 사용자로 실행하면 첫 태스크에서 멈춥니다 — 어딘가의
+첫 `sudo` 가 비밀번호를 기다리며 매달려 있는 대신에요.
 
 클러스터에 무언가를 하는 플레이북은 시작하면서 각 노드에 세 가지를 묻습니다. 통과하면 아무 말도
 하지 않고, 걸리면 무엇이 문제이고 무엇을 해야 하는지 적은 뒤 **아무것도 건드리지 않고 멈춥니다.**
@@ -1524,6 +1651,35 @@ etcd 알람은 **살아 있는 클러스터를 바꾸는 플레이북**(`add-nod
 값에 `null` 을 주면 그 항목은 **묻지 않습니다.** 디스크는 공간을 비워 답할 수 있지만 시간 소스가 아예
 없는 폐쇄망은 어떤 임계값으로도 답이 안 되므로, 그런 사이트를 위한 출구입니다. 시계를 `null` 로 두면
 오차뿐 아니라 동기 여부도 같이 묻지 않습니다.
+
+시간 소스가 **가끔만** 닿는 사이트는 그보다 앞에서 받쳐집니다. 시간은 두 단으로 흐릅니다. ki cp 노드는
+`ki_cp_ntp_server_upstream_servers` 의 상류를 직접 따르고, ki cp 노드 위의 ntp 서버(컨테이너)가 그
+노드의 시계를 같은 상류에 대고 재어 나머지 노드들에 내놓으며, 나머지 노드들은 그 서버만 봅니다. ki cp
+노드가 자기 위의 ntp 서버를 따르지 않는 것은 설계입니다 — 그 서버는 이 노드의 시계를 재어 보정값을
+내놓을 뿐 직접 시계를 만지지 못하므로(`chronyd -x`), 노드가 그 보정값대로 시계를 밀면 서로의 보정이
+서로의 오차가 되는 되먹임이 됩니다. 실측으로 상류가 멀쩡할 때도 컨테이너가 −471ppm, timesyncd 가
++500ppm 을 학습하고 있었고, 상류가 끊기자 25분에 11초가 어긋났습니다.
+
+`ki_cp_ntp_server_local_fallback`(기본값 `true`)이 켜져 있으면 상류가 하나도 선택되지 않을 때 ntp 서버가
+ki cp 노드의 **자기 시계**를 내놓아 나머지 노드들이 계속 그것을 따릅니다 — 서로는 맞고, 바깥과는 ki cp
+노드의 시계만큼 어긋납니다. 상류가 돌아오면 다시 상류를 따릅니다. 끄면 상류가 안 닿는 동안 ntp 서버가
+다시 시작된 뒤로는(재부팅, reset 뒤 재설치) 아무 시간도 내놓지 않고 노드들은 동기가 풀려 이 검사에
+걸립니다 — 검사하는 시계가 없느니 멈추는 쪽을 택하는 사이트의 선택입니다. 상류 목록을 비우면 처음부터 ki
+cp 노드의 시계가 유일한 시간이고, 그때는 이 값과 무관합니다. 그 경우에는 ki cp 노드도 자기 ntp 서버를
+따릅니다 — 잴 것이 없는 서버는 노드의 시계를 그대로 내놓으므로 되먹임이 없고, 아무것도 안 따르는 노드는
+동기됐다고 셀 수 없기 때문입니다. 둘 다 `update-cluster.yml` 이 ntp 서비스와 노드들의 시간 클라이언트를
+다시 설정해 적용합니다. 이 줄이 없는 옛 `vars.yml` 은 꺼진 것으로 읽힙니다.
+
+폴백이 받쳐 주지 못하는 자리가 하나 있습니다. 상류가 있는 사이트에서 **ki cp 노드 자신**은 상류를 직접
+따르므로, 상류가 끊긴 동안 그 노드의 시간 데몬이 다시 시작되면(재부팅, RHEL 의 chronyd 재시작) 따를
+것이 없어 동기 안 됨이 되고, 그 노드에 대한 플레이북은 이 검사에서 멈춥니다. 다른 노드들은 ki cp 의
+stratum 10 을 따라 멀쩡합니다. 상류가 돌아올 때까지 기다리거나, 그 사이는 `null` 로 검사를 끄는 것이
+답입니다. chrony 의 `local` 을 호스트에 줘도 `timedatectl` 은 동기로 보지 않으므로 설치본이 대신해 줄 수
+있는 것이 없습니다.
+
+`check-node-state.yml` 은 ki cp 노드가 자기 ntp 서버를 따르고 있으면(상류가 있는데도) 거부하고, 시간
+데몬의 주파수 보정이 400ppm 을 넘어도 거부합니다 — 후자는 되먹임을 겪은 데몬이 앉아 있는 자리이고,
+고리를 끊은 뒤에도 다시 배울 때까지 남아 있습니다.
 
 같은 점검을 **아무것도 건드리지 않고** 따로 돌려볼 수 있습니다. 업그레이드 창을 잡기 전에 묻기 좋습니다.
 
@@ -1584,6 +1740,8 @@ ki_cp_service_up{service="ki-cp-keepalived"} 1
 ki_cp_service_restarts_total{service="ki-cp-dns-server"} 3
 # VIP - HA 모드일 때만 나옵니다
 ki_cp_vip_held{vip="192.168.0.10"} 0
+# 클라우드의 망이 VIP 를 이 노드로 보내는가 - arp 가 아닌 캐리어일 때만 나옵니다
+ki_cp_vip_carried{vip="172.31.50.10"} 0
 # 이름이 풀리는가 (포트 연결이 아니라 실제 질의)
 ki_cp_dns_answers{name="ki-cp.ki.local"} 1
 # 레지스트리 - 루프백으로 물으므로 이 노드의 것입니다
@@ -1599,6 +1757,11 @@ ki_cp_metrics_written_seconds 1790000000
 ----
 # 아무도 VIP 를 안 들고 있거나(0), 둘이 들고 있거나(2 이상). 둘 다 장애입니다
 sum(ki_cp_vip_held) != 1
+
+# arp 가 아닌 캐리어: keepalived 와 클라우드의 망이 다른 노드를 보고 있습니다. 2분 넘게 가면
+# 캐리어의 API 호출이 계속 실패하는 중이고, 이유는 그 노드의 journalctl -u ki-cp-vip-carrier 에
+# 있습니다. 1분 안에 돌아오는 것은 분리뇌나 콘솔에서 옮긴 주소를 되찾는 유예입니다
+ki_cp_vip_held != ki_cp_vip_carried
 
 # 무엇이 죽었는지까지 나옵니다. restart 가 오르는 중이면 크래시루프입니다
 ki_cp_service_up == 0
@@ -1821,7 +1984,7 @@ tzdata 가 없어 시간대 이름을 받아도 찾을 것이 없고, ntp 는 ch
 
 * Ubuntu
 ** 22.04.0 ~ 22.04.5 지원
-** 24.04.0 ~ 24.04.4 지원
+** 24.04.0 ~ 24.04.5 지원
 * Redhat
 ** 8.0 ~ 8.10 지원
 ** 9.0 ~ 9.8 지원

@@ -25,6 +25,28 @@ def test_a_vip_outside_the_subnet_of_the_ki_cp_nodes_is_refused(hostvars):
     assert_refused(hostvars, naming="ki_cp_ha_mode_vip")
 
 
+def test_a_vip_carrier_without_ha_mode_is_refused(hostvars):
+    """aws-eni says the address is to be moved through the ec2 api, and a cluster
+    that is not in ha mode has no address to move."""
+    hostvars["localhost"]["ki_cp_ha_mode"] = False
+    hostvars["localhost"]["ki_cp_ha_mode_vip"] = None
+    hostvars["localhost"]["ki_cp_ha_mode_vip_carrier"] = "aws-eni"
+
+    assert_refused(hostvars, naming="ki_cp_ha_mode_vip_carrier")
+
+
+def test_a_vip_carrier_nobody_wrote_is_refused(hostvars):
+    hostvars["localhost"]["ki_cp_ha_mode_vip_carrier"] = "nlb"
+
+    assert_refused(hostvars, naming="ki_cp_ha_mode_vip_carrier")
+
+
+def test_the_ec2_vip_carrier_is_accepted_in_ha_mode(hostvars):
+    hostvars["localhost"]["ki_cp_ha_mode_vip_carrier"] = "aws-eni"
+
+    assert_accepted(hostvars)
+
+
 def test_a_control_node_outside_the_ki_cp_group_is_refused(hostvars):
     """The group is checked against the node the hostnames actually resolve to,
     which is what localhost_ih carries rather than what the inventory declares."""
@@ -59,6 +81,15 @@ def test_the_pod_subnet_overlapping_the_internal_network_is_refused(hostvars):
         node["k8s_pod_subnet"] = "192.168.0.0/16"
 
     assert_refused(hostvars, naming="k8s_pod_subnet")
+
+
+def test_kube_proxy_enabled_that_is_not_a_boolean_is_refused(hostvars):
+    """The template writes proxy.disabled from it either way, so a value that is
+    neither would render a cluster the user did not ask for."""
+    for node in hostvars.values():
+        node["k8s_kube_proxy_enabled"] = "maybe"
+
+    assert_refused(hostvars, naming="k8s_kube_proxy_enabled")
 
 
 def test_an_apiserver_argument_carrying_its_dashes_is_refused(hostvars):
@@ -115,3 +146,22 @@ def test_a_variable_no_class_covers_is_refused(hostvars, tmp_path):
     hostvars["localhost"]["ki_opt_ansible_path"] = str(ansible)
 
     assert_refused(hostvars, naming="a_variable_nothing_knows_how_to_apply")
+
+
+def test_the_connection_user_of_vars_yml_needs_no_class(hostvars, tmp_path):
+    """ansible_user says who to log in as, which no class applies and the
+    inventory may already carry per node, so vars.yml may carry it too."""
+    ansible = tmp_path / "ansible"
+    (ansible / "group_vars" / "all").mkdir(parents=True)
+    (ansible / "group_vars" / "all" / "vars.yml").write_text(
+        "ansible_user: operator\n", encoding="utf-8")
+    (ansible / "inventory.yml").write_text("all:\n  hosts: {}\n", encoding="utf-8")
+    hostvars["localhost"]["ki_opt_ansible_path"] = str(ansible)
+
+    assert_accepted(hostvars)
+
+
+def test_a_local_ntp_fallback_that_is_not_a_bool_is_refused(hostvars):
+    hostvars["localhost"]["ki_cp_ntp_server_local_fallback"] = "sometimes"
+
+    assert_refused(hostvars, naming="ki_cp_ntp_server_local_fallback")

@@ -70,7 +70,7 @@ parse_params "$@"
 # --- End of CLI template ---
 
 UBUNTU2204_SUPPORTED_MINOR_VERSION=5
-UBUNTU2404_SUPPORTED_MINOR_VERSION=4
+UBUNTU2404_SUPPORTED_MINOR_VERSION=5
 RHEL8_SUPPORTED_MINOR_VERSION=10
 RHEL9_SUPPORTED_MINOR_VERSION=8
 RHEL10_SUPPORTED_MINOR_VERSION=2
@@ -90,6 +90,8 @@ os_minor_version=""
 
 ki_tmp_root_path=""
 internal_network_ki_cp_dns_name=""
+node_is_ki_cp=""
+ki_cp_ntp_server_upstream_servers=""
 
 main() {
   require_file_exists "$vars_path"
@@ -101,6 +103,8 @@ main() {
 
   ki_tmp_root_path=$($yq_cmd ".ki_tmp_root_path" < "$vars_path")
   internal_network_ki_cp_dns_name=$($yq_cmd ".internal_network_ki_cp_dns_name" < "$vars_path")
+  node_is_ki_cp=$($yq_cmd '.group_names | contains(["ki_cp_node"])' < "$vars_path")
+  ki_cp_ntp_server_upstream_servers=$($yq_cmd -o json -I 0 ".ki_cp_ntp_server_upstream_servers" < "$vars_path")
 
   if [[ $os_distribution = "ubuntu" && $os_major_version = "22.04" && $os_minor_version -le "$UBUNTU2204_SUPPORTED_MINOR_VERSION" ]]; then
     ubuntu2204_setup
@@ -160,8 +164,36 @@ rhel10_setup() {
   systemctl restart chronyd
 }
 
+# What a node follows. A node that is not a ki cp follows the ki cp, whose ntp
+# server follows the upstream of the site. A ki cp node follows that upstream
+# itself, and must not follow its own ntp server: that server is a container
+# that measures the clock of this very node against the upstream and hands out
+# the corrected time without being allowed to apply it (chronyd -x), so a time
+# daemon on the node that steers the node's clock by what the container says
+# closes a loop in which each one's correction is the other's error. Measured
+# on a single node: the container learned a frequency of -471 ppm and timesyncd
+# pinned itself at +500 ppm, which held while the upstream answered and ran the
+# clock 11 seconds off in 25 minutes once it did not.
+#
+# With no upstream at all the ki cp node follows its own ntp server after all.
+# The loop needs the container to have measured something, and with nothing
+# to measure against it hands out the clock of this node as it is, so the node
+# steers by zero: this is the one case in which following it is harmless, and
+# the case in which a node that followed nothing would never count as
+# synchronised, which the clock check of check-node-state.sh asks about
+ntp_servers_of_this_node() {
+  local upstream_len
+  upstream_len=$($yq_cmd --null-input "$ki_cp_ntp_server_upstream_servers | length")
+  if [[ $node_is_ki_cp = "true" && $upstream_len -gt 0 ]]; then
+    echo "$ki_cp_ntp_server_upstream_servers"
+  else
+    echo "[\"$internal_network_ki_cp_dns_name\"]"
+  fi
+}
+
 create_timesyncd_conf_file() {
-  local ntp_servers=$internal_network_ki_cp_dns_name
+  local ntp_servers
+  ntp_servers=$($yq_cmd --null-input "$(ntp_servers_of_this_node) | join(\" \")")
 
   local tmp_file_path
   tmp_file_path="$ki_tmp_root_path"/tmp-templates-vars.yml
@@ -172,7 +204,8 @@ create_timesyncd_conf_file() {
 }
 
 create_chrony_conf_file() {
-  local ntp_servers="[\"$internal_network_ki_cp_dns_name\"]"
+  local ntp_servers
+  ntp_servers=$(ntp_servers_of_this_node)
 
   local tmp_file_path
   tmp_file_path="$ki_tmp_root_path"/tmp-templates-vars.yml

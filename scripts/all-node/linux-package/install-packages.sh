@@ -78,7 +78,7 @@ source "$SCRIPT_DIR_PATH/rpm-common.sh"
 source "$SCRIPT_DIR_PATH/deb-common.sh"
 
 UBUNTU2204_SUPPORTED_MINOR_VERSION=5
-UBUNTU2404_SUPPORTED_MINOR_VERSION=4
+UBUNTU2404_SUPPORTED_MINOR_VERSION=5
 RHEL8_SUPPORTED_MINOR_VERSION=10
 RHEL9_SUPPORTED_MINOR_VERSION=8
 RHEL10_SUPPORTED_MINOR_VERSION=2
@@ -222,53 +222,7 @@ ubuntu2404_install() {
 }
 
 rhel8_install() {
-  require_packages_installable
-  set_k8s_packages_path rhel8
-  require_declared_packages rhel8 rpm
-  setup_rpm_plan_args
-
-  local dirs=(
-    nfs-utils
-    p11-kit autogen-libopts gmp libidn2 libtasn1 nettle gnutls chrony
-    audit libsepol pcre2 libselinux libsemanage python3-setools checkpolicy mcstrans
-    policycoreutils selinux-policy container-selinux libseccomp containerd
-    systemd
-    libaio device-mapper fuse3 fuse-overlayfs libcgroup slirp conntrack
-  )
-  if [[ $(rhel_is_installed "^libibverbs\.") = "false" ]]; then
-    dirs+=(libibverbs)
-  fi
-  dirs+=(ebtables nftables docker nvidia-container-toolkit ethtool libbpf iproute socat)
-
-  local base="$ki_opt_bundle_path/linux-packages/rhel8"
-  rhel_require_installable "$base" "${dirs[@]}"
-
-  [[ $(getenforce) != "Disabled" ]] && setenforce 0
-
-  yum erase -y --disableplugin subscription-manager \
-    systemd-timesyncd \
-    ntp \
-    chrony
-
-  yum erase -y --disableplugin subscription-manager \
-    podman \
-    runc \
-    systemd-container
-
-  local dir
-  for dir in "${dirs[@]}"; do
-    rhel_install_rpms "$base/$dir"
-    if [[ $dir = "systemd" ]]; then
-      rhel_reexec_systemd_if_installed
-    fi
-  done
-  rhel_install_rpms "$k8s_packages_path"
-
-  "$ki_opt_scripts_path/systemctl.sh" reload
-
-  settle_units
-
-  return 0
+  rhel_install rhel8
 }
 
 rhel9_install() {
@@ -279,16 +233,18 @@ rhel10_install() {
   rhel_install rhel10
 }
 
-# rhel 9 and 10 are one path over two directories. The closure of each was
+# rhel 8, 9 and 10 are one path over three directories. The closure of each was
 # resolved on the oldest minor the release supports against what that minor
-# already has, so a directory holds the principal package and whatever an old
-# minor lacks for it, and the two directories hold the same names in the same
-# order. rhel 8 keeps a path of its own above: its closure was gathered
-# differently and carries things 9 dropped altogether, such as libcgroup and the
-# legacy ebtables.
+# already has (tools/build-bundle-packages.sh), so a directory holds the
+# principal package and whatever an old minor lacks for it, and the three
+# directories hold the same names in the same order. What one rhel needs and
+# another does not, such as the libcgroup of 8 or the devel headers only its
+# bundle carries, is inside the directory that asked for it or is a directory
+# the other two leave empty.
 #
-# iptables-nft stands where ebtables stood. kubelet and docker both ask for
-# iptables, and on 9 and 10 the only thing that provides it is the nft backed one
+# iptables is the one principal whose package differs: on 8 it is iptables
+# itself with the ebtables shim beside it, and from 9 on the only thing that
+# provides what kubelet and docker ask for is iptables-nft
 rhel_install() {
   local os_dir=$1
 
@@ -306,7 +262,9 @@ rhel_install() {
   if [[ $(rhel_is_installed "^libibverbs\.") = "false" ]]; then
     dirs+=(libibverbs)
   fi
-  dirs+=(iptables-nft nftables docker nvidia-container-toolkit ethtool iproute socat)
+  # iptables: iptables itself on 8, iptables-nft from 9 on. devel: the headers of
+  # what came before, which only the rhel 8 bundle carries; empty on the others
+  dirs+=(iptables nftables docker nvidia-container-toolkit ethtool iproute socat devel)
 
   local base="$ki_opt_bundle_path/linux-packages/$os_dir"
   rhel_require_installable "$base" "${dirs[@]}"

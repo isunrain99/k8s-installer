@@ -78,7 +78,7 @@ source "$SCRIPT_DIR_PATH/all-node/linux-package/rpm-common.sh"
 source "$SCRIPT_DIR_PATH/all-node/linux-package/deb-common.sh"
 
 UBUNTU2204_SUPPORTED_MINOR_VERSION=5
-UBUNTU2404_SUPPORTED_MINOR_VERSION=4
+UBUNTU2404_SUPPORTED_MINOR_VERSION=5
 RHEL8_SUPPORTED_MINOR_VERSION=10
 RHEL9_SUPPORTED_MINOR_VERSION=8
 RHEL10_SUPPORTED_MINOR_VERSION=2
@@ -205,7 +205,6 @@ ubuntu2404_setup() {
 
 rhel8_setup() {
   if [[ $(rhel_is_installed python3\.12) = "false" ]]; then
-    rhel_install_dir "$KI_OPT_BUNDLE_PATH/linux-packages/rhel8/chkconfig"
     rhel_install_dir "$KI_OPT_BUNDLE_PATH/linux-packages/rhel8/python3.12"
   fi
 
@@ -231,8 +230,9 @@ rhel8_setup() {
 }
 
 # rhel 9 boots with python 3.9 and carries 3.12 as a package of its own, the way
-# rhel 8 does. Unlike the rhel 8 one it does not go through alternatives, so
-# there is no chkconfig to lay down first.
+# rhel 8 does. Both directories come from tools/build-bundle-packages.sh, so the
+# alternatives the rhel 8 one goes through arrives inside it when the oldest
+# minor lacks it.
 #
 # The directory is laid down whether or not python3.12 is there, unlike on rhel
 # 8. It carries what the python of the newest minor needs at run time and rpm

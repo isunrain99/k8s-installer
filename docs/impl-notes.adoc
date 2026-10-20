@@ -696,6 +696,27 @@ resolved 가 켜져 있었으면, resolved 가 꺼져 있거나 아예 없는 �
 없이는 `update-cluster.yml` 이 서비스 변수 변경으로 resolved 를, kubelet 변수 변경으로 경로를
 각각 고치며, ConfigMap 의 옛 값은 후자가 기준선을 다시 올릴 때 사라집니다.
 
+=== 노드의 자기 이름은 /etc/hosts 에 둡니다
+
+설치본이 쓰는 `resolv.conf` 에는 nameserver 뿐이고 search 도메인이 없습니다. 노드가 갖고 있던
+search 도메인은 dhcp 임대가 준 것이라 설치본이 모르는 망의 이름이기 때문입니다. 그러면서 잃는
+것이 **노드의 자기 이름**입니다. 클라우드 이미지의 호스트 이름은 `ip-172-31-62-61` 같은 것이고,
+그 이름은 그 클라우드의 리졸버만 search 도메인을 붙여 풀어 줍니다. ki cp dns 가 공개 업스트림으로
+넘기는 순간 이름은 사라지고, 제일 먼저 그렇다고 말하는 것이 sudo 입니다 — 부를 때마다 자기
+호스트를 찾아보고 못 찾으면 부를 때마다 경고합니다. 경고는 stderr 로 가고 설치본이 그것을
+답으로 읽는 곳은 없지만, sudo 마다 그 줄이 찍히는 셸은 진짜 메시지가 그 사이에 묻히는 셸이고,
+kubeadm 과 kubelet 도 같은 이름을 찾습니다. EC2 에서 처음 드러났고(2026-09), 그때는 user-data 로
+`/etc/hosts` 에 한 줄을 넣어 피했습니다.
+
+그래서 `setup-resolv-conf.sh` 가 resolv.conf 를 쓴 뒤 노드의 이름을 노드의 내부망 주소로
+`/etc/hosts` 에 적습니다. 그 주소는 dhcp 리졸버가 답했을 값이고 kubelet 이 등록된 값입니다.
+ki cp dns 의 레코드가 아니라 hosts 파일인 이유는, 노드가 자기 이름을 알아야 하는 때가 바로 그
+dns 가 ki cp 노드 사이에서 넘어가는 중이기 때문입니다 — 그때 그 노드에서 sudo 가 제일 많이
+불립니다. 이미 설치본이 쓰지 않은 줄이 그 이름을 적고 있으면 두지 않습니다. 사이트가 고른
+주소로 일부러 적어 둔 것입니다. 설치본의 줄은 표식을 달고 매 실행마다 다시 쓰며, 리셋은 그
+줄을 남깁니다. 리셋이 노드에게 옛 리졸버를 돌려주지 않는 것과 같은 이유로, 업스트림으로
+푸는 노드도 자기 이름은 있어야 합니다.
+
 == 컨테이너에게 GPU 를 주는 쪽 (CDI)
 
 가상머신에 카드를 통째로 넘기는 것과 반대편입니다. 이쪽은 설치본이 거의 아무것도 하지 않는데,
@@ -1320,6 +1341,87 @@ weight 를 빼면 실패한 스크립트가 인스턴스를 FAULT 로 보냅니�
 그 대가로 설치 후 VIP 가 node1 에 고정되지 않고 keepalived 가 먼저 안정된 노드에 붙습니다.
 어느 ki cp 노드가 들든 서비스는 같으므로 받아들일 만하고, 대안은 설치마다 VIP 를 한 번씩
 헛되이 옮기는 것입니다.
+
+=== EC2 에서는 주소를 API 로 옮깁니다
+
+VPC 는 gratuitous ARP 를 듣지 않습니다. 인터페이스에 등록된 주소로만 패킷을 보내므로,
+keepalived 가 VIP 를 올려도 아무것도 오지 않습니다. 선출은 처음부터 `unicast_peer` 라 VPC
+에서도 되고 있었고, 빠진 것은 "이 주소는 이제 내 인터페이스 것" 이라고 VPC 에게 말하는 한
+호출(`AssignPrivateIpAddresses`, `AllowReassignment`)이었습니다. `ki_cp_ha_mode_vip_carrier`
+의 `aws-eni` 가 그 호출입니다.
+
+NLB 를 VIP 자리에 두는 것은 보지 않았습니다. 설치본 밖에서 만드는 자원이고, 정적 IP 가 AZ
+마다 하나라 "주소 하나" 를 전제로 한 dns 레코드·레지스트리 인증서·`ki_cp_vip_held` 가 전부
+다른 뜻이 됩니다. 라우트 테이블에 VPC 밖 주소를 넣고 그 경로를 옮기는 방식은 ki cp 노드를
+여러 AZ 에 둘 수 있지만, VIP 가 서브넷 안이어야 한다는 검증과 src/dst check 와 워커 서브넷의
+라우트 테이블 전부를 끌고 오므로, 그 요구가 실제로 생기면 그때 볼 일입니다.
+
+==== 클라우드를 아는 것은 캐리어 모듈 하나입니다
+
+`ki_cp_ha_mode_vip_carrier` 의 값은 클라우드가 아니라 주소를 나르는 방식의 이름입니다. 한
+클라우드에 방식이 둘일 수 있고(EC2 의 ENI 보조 IP 와 라우트 테이블), 어떤 클라우드는 포트에 한
+번 적어 두면 `arp` 가 그대로 됩니다(OpenStack 의 allowed-address-pairs). 그래서 `aws-eni` 이지
+`aws` 가 아닙니다.
+
+클라우드를 아는 코드는 `scripts/ki-cp-node/keepalived/carriers/<이름>.py` 하나이고, 디스패처
+`carry-vip.py --carrier <이름>` 이 그 모듈을 이름으로 읽어 셋을 묻습니다. `carry(args)` 는 망이
+VIP 를 이 노드로 보내게 하는 것(이미 그러면 무동작, 이전 보유자의 자원을 손대도 됨, 놓는 동사는
+없음), `probe(args)` 는 지금 보내는가(자격증명 없이, 자주 물어도 되게), `preflight(args)` 는 이
+노드가 나를 수 있는가(부작용 없이, 걸리는 것을 전부 적어서). 캐리어는 `add_arguments` 로 자기
+옵션을 더할 수 있고, `aws-eni` 는 테스트가 메타데이터와 API 자리에 가짜를 세우는 데 그것을 씁니다.
+
+keepalived 템플릿, `notify.sh`, 유닛, 메트릭, `check-node-state.sh` 는 전부 캐리어 이름만 넘기고
+그 안을 모릅니다. 메트릭은 디스패처가 매번 남기는 `state/carried` 파일만 읽습니다. 다음 클라우드는
+모듈 하나, 검증기의 허용 값 한 줄, README 의 준비 절 하나, 테스트 하나입니다.
+
+`arp` 도 캐리어입니다. `carry` 와 `preflight` 는 무동작이고 `probe` 는 인터페이스에 주소가 있는지
+입니다. 다만 `arp` 에는 유닛을 두지 않습니다 — 무동작인 carry 를 깨울 이유가 없고, 온프렘 노드에
+타이머가 하나 늘어서 좋을 것이 없습니다. 호출부에서 `arp` 를 이름으로 보는 곳은 그 하나뿐입니다.
+
+==== 호출은 컨테이너가 아니라 호스트가 합니다
+
+keepalived 의 `notify` 는 컨테이너 안에서 돕니다. 거기서 API 를 부르려면 인스턴스 자격증명과
+서명기가 컨테이너에 있어야 하고, 이미지는 상류 것을 digest 로 고정해 둔 것입니다. 그래서
+`notify.sh` 는 keepalived 가 넘긴 상태 한 단어를 바인드 마운트된 파일에 적는 것이 전부이고,
+호스트의 path 유닛이 그 파일을 보고 `carry-vip.py reconcile` 을 깨웁니다. 파이썬은 설치본의
+venv 에 이미 있고, 서명은 표준 라이브러리로 됩니다. 메트릭 타이머가 이미 같은 모양입니다.
+
+`reconcile` 은 한 번 돌고 끝나는 `oneshot` 이고, 다시 부르는 것은 15초 타이머입니다. 재시도를
+스크립트 안의 루프로 두면 유닛이 `simple` 이어야 하고(`Restart=` 가 붙은 `oneshot` 은 RHEL 8 의
+systemd 가 거부합니다), 그러면 "한 번 묻고 답을 파일에 남긴다" 가 아니라 "돌고 있는 프로세스" 를
+관리하게 됩니다. 타이머면 실패한 실행이 `systemctl --failed` 에 그대로 보이고, 매 실행이 상태
+파일을 다시 읽으므로 API 가 거부하는 동안 BACKUP 으로 내려간 노드가 서비스 중인 노드의 주소를
+가져가는 일이 없습니다.
+
+==== 떼는 호출은 없습니다
+
+BACKUP 으로 갈 때 `UnassignPrivateIpAddresses` 를 부르지 않습니다. 주소는 다음 MASTER 의
+`AllowReassignment` 이 가져가면서 떨어집니다. VRRP 가 막혀 둘이 MASTER 라고 믿는 분리뇌에서
+떼는 호출까지 있으면 각자가 상대의 주소를 떼고, 없으면 마지막에 부른 쪽이 들고 있습니다.
+어느 쪽도 정상은 아니지만 후자는 적어도 누군가에게 도착합니다. 분리뇌는
+`ki_cp_vip_held != ki_cp_vip_carried` 가 잡습니다.
+
+==== 어긋남은 타이머가 보고, FAULT 로 내리지 않습니다
+
+`notify` 는 전이 때만 옵니다. 콘솔에서 누가 주소를 옮겼거나 전이 순간에 API 가 죽어 있었으면
+MASTER 는 그대로인데 망은 다른 데를 봅니다. 그것을 되돌리는 것은 15초 타이머의 `reconcile` 입니다.
+
+keepalived 의 헬스체크(`check_node.sh`)에 넣지 않습니다. 두 가지 이유입니다. 첫째, 거기에 넣으면
+인스턴스를 FAULT 로 보내게 되는데, 망이 안 보내는 것은 이 노드의 잘못이 아니고 다른 노드로 옮겨도
+똑같은 API 를 불러야 하므로 옮겨서 얻는 것이 없습니다. <<VIP 를 언제 옮기는가>> 의 기준
+그대로입니다. 둘째, 보고만 하려고 해도 그 자리에서는 안 됩니다. `vrrp_script` 의 `timeout` 기본값은
+`interval` 이라 3초이고, 메타데이터가 느린 순간 스크립트가 그걸 넘기면 keepalived 는 실패로 세어
+`fall 10` 뒤 FAULT 로 내립니다. 헬스체크는 로드밸런서만 묻는 채로 두어야 그 경로가 깨끗합니다.
+
+==== 전이가 아니면 뺏기 전에 기다립니다
+
+전이 직후에는 바로 가져옵니다. 이전 보유자가 잃는 것이 맞고, 상태 파일이 방금 쓰였다는 것이 그
+근거입니다. 상태 파일이 오래된 채로 주소가 남에게 있으면 둘 중 하나입니다 — 운영자가 콘솔에서
+옮겼거나, VRRP 가 막혀 둘 다 MASTER 라고 믿는 분리뇌. 둘 다 되찾지만 60초 동안 떨어져 있을 때만
+되찾습니다. 그렇지 않으면 분리뇌에서 두 노드가 15초마다 번갈아 `AllowReassignment` 로 서로의
+주소를 뺏어 VIP 가 끊임없이 오갑니다. 유예를 두면 분 단위로 오가고, 그 사이
+`ki_cp_vip_held != ki_cp_vip_carried` 가 그것을 말할 시간이 생깁니다. 처음 본 시각은
+`state/pending` 에 적고, 주소가 돌아오거나 노드가 MASTER 가 아니게 되면 지웁니다.
 
 === 설정이 바뀌어도 컨테이너를 다시 만들지 않습니다
 
@@ -1990,6 +2092,69 @@ hostvars 에서 읽습니다.
 `k8s_node_labels` 에 적을 수 없게 거부되기 때문입니다. 안전하긴 하지만 우연히 안전한 것이었고,
 이제는 읽을 옛 기록 자체가 없습니다.
 
+== kube-proxy 를 끄는 변수
+
+kubeadm 은 `kubeadm init` 의 addon 단계에서 kube-proxy DaemonSet 을 만들고, 설치본은 그 단계를
+그대로 돌렸습니다. 서비스 라우팅을 CNI 가 맡는 사이트(cilium 의 kubeProxyReplacement, calico 의
+eBPF 모드)는 그것을 끌 길이 없었습니다. `k8s_kube_proxy_enabled` 가 그 스위치입니다.
+
+=== skipPhases 가 아니라 proxy.disabled 인 이유
+
+kubeadm 에는 끄는 길이 둘 있습니다. `InitConfiguration.skipPhases` 에 `addon/kube-proxy` 를 적는 것과,
+v1beta4 부터 생긴 `ClusterConfiguration.proxy.disabled` 입니다. init 에서는 둘이 같습니다 — kubeadm
+의 `manageSkippedAddons` 가 한쪽을 다른 쪽으로 맞춥니다. 갈리는 것은 그 뒤입니다. `kubeadm upgrade
+apply` 와 `upgrade node` 는 `kubeadm-config` ConfigMap 에서 ClusterConfiguration 을 읽어 `proxy.disabled`
+면 addon/kube-proxy 단계를 건너뛰는데(`[upgrade/addon] Skipping the addon/kube-proxy phase. The addon
+is disabled.`), skipPhases 는 init 이 한 번 읽고 어디에도 남기지 않는 목록입니다. 업그레이드 쪽의
+`skipPhases` 는 문서가 "currently ignored" 라고 적어 두었습니다.
+
+그래서 값은 `kubeadm-cluster-config.yml.j2` 에 있고, 켜든 끄든 항상 씁니다. 그 템플릿은
+`init-k8s-cluster.sh` 와 `upload-k8s-cluster-config.sh` 가 같이 렌더하므로 렌더된 파일이 `vars.yml`
+이 말하는 바를 그대로 들고 있게 되고, 업그레이드가 읽는 값과 사용자가 적은 값이 한 군데서 갈리지
+않습니다. kubeadm 은 `disabled: false` 를 `proxy: {}` 로 저장하는데(EC2 에서 확인), 이 줄이 생기기
+전의 클러스터가 들고 있는 것이 바로 그것이라 그런 클러스터의 ConfigMap 은 움직이지 않습니다. `upgrade-k8s-node.sh` 는 손대지 않았습니다 —
+`--config` 없이 돌고, 읽는 것은 클러스터입니다.
+
+=== 서브넷과 달리 폴백이 있는 이유
+
+파드와 서비스 서브넷은 `constant-vars.yml` 에 폴백을 두지 않았습니다. 어디서나 맞는 값이 없어서
+줄이 없으면 `Field required` 로 걸려야 했습니다. 이 변수는 반대입니다. 설치본 업그레이드는 사용자의
+`vars.yml` 을 그대로 두므로 이 줄이 없는 파일은 이 줄이 생기기 전에 세운 클러스터이고, 그런
+클러스터는 전부 kube-proxy 가 있습니다. `true` 가 그것을 그대로 두는 값이라 폴백입니다.
+
+=== immutable 인 이유
+
+kube-proxy 는 kubeadm 이 init 에 한 번 만드는 DaemonSet 입니다. 서 있는 클러스터에서 빼는 것은
+DaemonSet 을 지우고 그것이 쓴 iptables/ipvs 규칙을 모든 노드에서 걷어 내는 일이고(`kube-proxy
+--cleanup`), 넣는 것은 `kubeadm init phase addon kube-proxy` 를 다시 돌리는 일입니다. 둘 다 할 수는
+있지만 `update-cluster.yml` 이 하는 일이 아니고, 절반만 되면 — ConfigMap 은 꺼졌다는데 DaemonSet
+은 돌고 있는 — 다음 업그레이드가 그 DaemonSet 을 영영 건너뜁니다. 서브넷과 같은 이유로 거부합니다.
+
+=== 기록 전 공백과 클러스터에 묻는 체크
+
+immutable 을 지키는 것은 `diff-applied-vars.py` 인데, 기록에 없는 변수는 변경이 아니라 baseline 으로
+받습니다. 그래서 이 줄이 생긴 설치본을 올린 뒤 첫 `update-cluster.yml` 전에 `false` 로 고치면 검사를
+지나고, 그 값이 기록됩니다. EC2 에서 재현해 보니 그 자리에서 ConfigMap 이 바뀌는 것은 아닙니다 —
+업로드는 `cluster_config` 클래스의 변경이 있을 때만 돌고 baseline 은 변경이 아니라서요. 대신 기록이
+틀린 채로 남습니다. kube-proxy 가 도는 클러스터의 기록이 `false` 라서, `true` 로 되돌리는 것은
+이제 immutable 변경으로 거부되고, 다음에 `cluster_config` 변수 하나라도 바뀌면 그때 `proxy.disabled:
+true` 가 올라가 업그레이드가 돌고 있는 kube-proxy 를 영영 건너뜁니다.
+
+그래서 `check-kube-proxy-as-declared.yml` 이 `update-cluster.yml` 에서 diff 다음, 무엇을 적용하거나
+기록하기 전에 클러스터에 묻습니다. 컨트롤 플레인 노드 하나에서 kube-proxy DaemonSet 이 있는지 보고
+변수와 다르면 멈춥니다. 기록은 그 뒤에 쓰이므로 틀린 값이 남을 길이 없고, 사용자는 값을 되돌려
+다시 돌리면 됩니다. 양쪽 다입니다 — kube-proxy 없이 세운 클러스터에서 `true` 로 하는 것도 DaemonSet
+이 생기지 않는 채로 설정만 바뀌는 일이기 때문입니다. apiserver 가 답하지 않은 것은 "DaemonSet 이
+없다" 가 아니므로 따로 멈춥니다. 노드 스크립트가 아니라 플레이북에 둔 것은
+`check-kubelet-serving-cert.yml` 과 같은 이유입니다 — 변수가 클러스터 하나에 하나이니 답도 플레이에
+하나이고, 체크가 사는 곳이 기록을 쓰는 곳과 같은 파일이어야 순서가 보입니다.
+
+=== 노드별로 못 씁니다
+
+ClusterConfiguration 은 init 을 돌린 노드 하나의 변수로 렌더됩니다. 노드에 적힌 값은 받아들여지고도
+아무 뜻이 없으므로 `kubelet_server_tls_bootstrap` 과 같이 `CLUSTER_WIDE_VARS` 에 넣어
+`validate_cluster_wide_vars` 가 거절합니다.
+
 == 노드 라벨과 테인트
 
 노드를 배치에 쓰려면 라벨이 필요하고, 비워 두려면 테인트가 필요합니다. 둘 다 설치본 밖에서
@@ -2473,13 +2638,13 @@ containerd 를 그대로 둔 릴리스의 `--update` 는 전부 여기서 멈춥
 아니므로, 건너뛰기를 그 이름으로 쓰지 않았습니다. ubuntu 쪽 dpkg 는 같은 버전 재설치를 그냥
 받아들이므로 이 문제가 없습니다.
 
-=== rhel 9·10 과 우분투의 closure 는 지원 하한에서 뽑습니다
+=== rhel 과 우분투의 closure 는 지원 하한에서 뽑습니다
 
-`bundle/linux-packages/rhel9`, `rhel10`, `ubuntu22.04`, `ubuntu24.04` 는
+`bundle/linux-packages` 의 `rhel8`, `rhel9`, `rhel10`, `ubuntu22.04`, `ubuntu24.04` 는 전부
 `tools/build-bundle-packages.sh` 가 채웁니다. 디렉토리 하나가 대표 패키지 하나와 **그 기계에 없는
 의존성**이고, 패키지 관리자가 그 기계에 깔린 것을 기준으로 답하므로 어느 기계에서 돌리느냐가 곧
-번들이 무엇을 드는지입니다. **지원하는 가장 낮은 릴리스**에서 돌립니다 — rhel 은 하한 마이너,
-우분투는 GA 이미지입니다(우분투는 아래 따로). 9.0 기준으로 뽑은 `nfs-utils` 디렉토리에는 9.8 의 `selinux-policy` 와
+번들이 무엇을 드는지입니다. **지원하는 가장 낮은 릴리스**에서 돌립니다 — rhel 은 하한 마이너(8.0,
+9.0, 10.0), 우분투는 GA 이미지입니다(우분투는 아래 따로). 9.0 기준으로 뽑은 `nfs-utils` 디렉토리에는 9.8 의 `selinux-policy` 와
 `policycoreutils` 가 같이 들어오고, 9.8 노드는 그것을 이미 그 버전으로 갖고 있어
 `rhel_install_rpms` 가 건너뜁니다. 저장소는 어느 마이너가 묻든 그 메이저의 최신을 주므로, 내용은
 최신 마이너의 것이고 범위만 옛 마이너까지 내려갑니다. 9.2 에서 뽑았을 때는 9.1 이
@@ -2498,23 +2663,82 @@ containerd 를 그대로 둔 릴리스의 `--update` 는 전부 여기서 멈춥
 AMI 는 `--root /` 로 기계 자신), 지원 범위의 다른 이미지(9.0 KVM rpmdb), 마지막으로 가장 낡은 이미지의 rpmdb 를
 `@core` 최소 설치 이름으로 깎은 것입니다. 깎는 법은 도구 머리말에 있습니다 — `@core` 를 `--installroot` 로 한 번
 깔아 이름 목록을 얻고, rpmdb 사본에서 목록 밖 패키지를 `rpm -e --justdb --nodeps` 로 db 에서만 지웁니다.
-RHEL 10 의 rpmdb 는 `/usr/lib/sysimage/rpm` 에 있고 `/var/lib/rpm` 은 링크라 둘 다 복사해야 합니다(링크만
-복사하면 빈 db 가 되어 전부를 뽑습니다). 이름 중복은 설치 순서의 디렉토리들 사이에서만 하나로 세고, 홀로
-설치되는 디렉토리(`python3.12`, 우분투의 venv 디렉토리들, `kernel`)는 안에서만 셉니다 — 기준 안의 dedupe 가
-그것들을 빼는 것과 같은 이유입니다. 기준 둘을 그냥 합치면 한 디렉토리에 `sssd-nfs-idmap` 이 두 버전으로
-들어왔는데, 첫 기준이 버전을 정하는 규칙이 그것을 막습니다.
+RHEL 10 의 rpmdb 는 `/usr/lib/sysimage/rpm` 에 있고 `/var/lib/rpm` 은 링크라 둘 다 복사하거나, `var/lib/rpm`
+만 두면 도구가 그 자리에 링크를 겁니다(없으면 빈 db 로 읽혀 전부를 뽑습니다). 합칠 때 첫 기준은 통째로
+받고(아래의 누적 해석으로 디렉토리끼리 이미 맞아 있습니다), 뒤 기준은 앞에서 안 나온 이름만 보태되 이름은
+**그룹** 안에서 하나로 셉니다 — 설치 순서의 디렉토리들이 한 그룹이고, 홀로 설치되는 `python3.12`, 우분투의
+venv 디렉토리들, `kernel` 은 제 그룹입니다. 기준 둘을 그냥 합치면 한 디렉토리에 `sssd-nfs-idmap` 이 두
+버전으로 들어왔습니다. 그래서 이름마다 파일 하나입니다 — **모든 기준 중 가장 높은 빌드**를, **가장 앞선
+디렉토리**에. 높은 빌드인 이유: 기준마다의 요구는 하한이라 가장 높은 것이 전부를 채우고, 한 디렉토리에
+한 이름이 두 빌드로 들어가면 rpm 이 그 트랜잭션에서 죽습니다(8.3 기준은 nfs-utils 에서 libsemanage 를
+2.9-10 으로, devel 에서 2.9-12 로 올리고 8.0 기준은 nfs-utils 에서 바로 2.9-12 로 올려서, 첫 기준의 두
+빌드를 다 두는 규칙으로는 nfs-utils 에 둘이 나란히 들어왔습니다). 앞선 디렉토리인 이유: 8.6 기준은
+gnutls 를 devel 에서야 올리고(헤더가 정확한 버전을 요구해서) 8.0 기준은 chrony 에서 올리는데(8.0 의
+gnutls 가 chrony 4.5 에 너무 낮아서), devel 에 두면 8.0 노드가 chrony 에서 막힙니다. 어느 이미지에서
+그 빌드와 같이 움직여야 하는 짝은 아래의 모의 설치가 찾습니다.
+
+합친 뒤에는 **기준마다 rpm 으로 모의 설치**합니다. 기준의 rpmdb 사본에 디렉토리를 노드 순서대로
+`rpm -U --justdb --force` 로 넣으면(db 에만 적용, 파일은 안 건드림) 그 이미지의 노드가 거부할 것을 같은
+이유로 거부합니다. 나오는 것은 둘입니다. 합집합이 올리는 패키지의 **lockstep 짝**을 그 이미지가 갖고
+있는 경우 — 헤더가 원하는 `unbound-libs` 옆에 8.3 이후 이미지는 `python3-unbound` 를 두고 있어 rpm 이
+하나만 올리기를 거부합니다 — 짝을 최신 빌드로 같은 디렉토리에 보탭니다. 그리고 어느 기준이 고른 패키지가
+그 기준에는 있고 이 이미지에는 없는 것을 요구하는 경우, 제공자를 보탭니다. 보탠 디렉토리는 다음으로
+넘어가기 전에 **같은 자리에서 다시 시도**합니다 — 뒤 디렉토리는 앞 디렉토리가 들어간 상태를 전제로
+풀려 있어서, 실패한 채 넘어가면 뒤 전부가 앞 것이 없다고 떨어지고 그 "고침" 은 이미 있는 것을 다시
+받는 것입니다(9.0 기준에서 nfs-utils 가 keyutils-libs 로 멈춘 뒤 container-selinux, containerd, docker 가
+연쇄로 떨어졌고 containerd.io 를 선언 버전이 아닌 2.4.2 로 받아 왔습니다). 보태는 것은 번들에 이미 있으면
+그 파일을 복사하고, `release.yml` 이 박은 이름이면 그 버전으로, 제공자가 여럿이면 이미지가 깔고 있는
+쪽으로(`selinux-policy-any` 를 mls 가 아니라 targeted 로) 고릅니다. 커널 디렉토리는 노드처럼 `-i` 로
+옆에 놓고 봅니다(`-U` 로 보면 실행 중 커널을 빼내 이미지의 `kernel` 패키지가 떨어집니다). 보탠 뒤 모든
+기준을 다시 돌려 아무것도 안 보탤 때까지 반복합니다. 이것이 손으로 이름 대던
+`policycoreutils-python-utils` 류를 데이터로 대신합니다. rhel 9/10 을 이 도구로 다시 뽑아 발행본과
+비교하면 구조는 같고 저장소 드리프트만 다른데, 9.0 KVM 기준에서 `keyutils-libs` 하나가 더 잡혔습니다.
 
 가장 낮은 마이너에 저장소가 없을 때는 `--root` 를 씁니다. Red Hat 은 지원이 끝난 마이너의 클라우드
 이미지를 내리고, 고객 포털의 KVM guest 이미지에는 저장소가 하나도 없습니다. dnf 는 받은 루트의
 rpm 데이터베이스를 기준으로 풀므로, 그 마이너의 깨끗한 기계에서 `/var/lib/rpm` 과
 `/etc/os-release` 만 복사해 두면 저장소가 있는 같은 메이저의 아무 기계에서나 됩니다
 (`/etc/os-release` 는 심볼릭 링크라 실제 파일로 복사할 것). 그 기계에 무엇이 깔려 있는지는 보지
-않습니다.
+않습니다. rhel 8 의 데이터베이스는 Berkeley DB 라 복사본의 `__db.*` 를 도구가 지우고, rhel 10
+의 rpm 은 `/usr/lib/sysimage/rpm` 에서만 찾으므로 `var/lib/rpm` 만 둔 루트는 **아무것도 안
+깔린 기계**로 읽혀 디렉토리마다 glibc 까지 새 설치로 들어옵니다(259개, 325M 로 불어났습니다).
+도구가 그 경로에 링크를 걸어 둡니다.
 
-`rhel8` 디렉토리와 모양이 다른 이유입니다. 그쪽은 gnutls 사슬과 selinux 사슬이 디렉토리 열 개로
-따로 있고 `-devel` 까지 실려 있는데, 9 와 10 에서는 chrony 와 container-selinux 를 풀면 그것들이
-안에 따라옵니다. `libcgroup` 과 `ebtables` 는 9 부터 없고, kubelet 과 docker 가 요구하는
-`iptables` 를 제공하는 것은 `iptables-nft` 뿐이라 그 자리에 그것이 섭니다.
+세 rhel 이 같은 디렉토리 이름을 같은 순서로 씁니다(`install-packages.sh` 의 `rhel_install`).
+`rhel8` 은 2026-10-07 까지 8.10 에서 손으로 채운 디렉토리 44개(gnutls 사슬과 selinux 사슬이
+디렉토리 열 개로 따로, `-devel` 포함)였는데, 같은 도구로 8.0 기준으로 다시 뽑으면 그것들이
+`chrony` 와 `nfs-utils` 안에 따라 들어오고 `libcgroup` 은 docker, `libbpf` 는 iproute 안에
+들어옵니다. 손으로 채우던 시절부터 싣던 `-devel` 헤더(gnutls 사슬과 selinux 사슬의 열 개)는
+그대로 싣되 `devel` 디렉토리 하나로 맨 마지막에 깝니다 — 헤더는 라이브러리와 정확히 같은
+버전을 요구하므로 앞 디렉토리들이 올려 둔 뒤여야 합니다. 9 와 10 에는 그 디렉토리가 없고 노드
+스크립트는 rpm 없는 디렉토리를 건너뜁니다. `iptables` 디렉토리는 8 에서는 `iptables` +
+`iptables-ebtables`, 9 부터는 `iptables-nft` 입니다 — kubelet 과 docker 가 요구하는 `iptables`
+를 9 부터 제공하는 것이 그것뿐이라서입니다.
+
+rhel 8 에서는 rpm 의존성이 말해 주지 않는 것이 넷 더 있어 대표로 직접 이름 댑니다.
+**libseccomp**: containerd.io 의 runc 가 `seccomp_api_get` 을 부르는데 libseccomp 2.4 부터 있는
+심볼이고 8.0 은 2.3.3 이며 요구는 무버전이라, 8.0 노드에서 모든 컨테이너가 `undefined symbol`
+로 죽었습니다(docker 는 `runc did not terminate successfully: exit status 127` 로만 말합니다).
+**libpcap**: iptables 가 요구하는데 8.0 이미지에는 있고 8.4 부터의 이미지에는 없습니다.
+**pkgconf 묶음 넷**: `-devel` 이 pkg-config 를 요구하는데 8.0 에는 있고 8.1~8.3 에는 없습니다.
+**policycoreutils-python-utils**: 8.6 부터의 이미지에 있고 8.0 에는 없는데, nfs-utils 가 올리는
+`python3-policycoreutils` 와 같은 빌드여야 해서 함께 올립니다. 즉 **마이너마다 이미지의 패키지
+집합이 8.0 과 양방향으로 다르고**, 기준은 그중 한 이미지일 뿐입니다. 그래서 도구는 대표로 이름
+댄 것은 기준 이미지가 이미 최신으로 갖고 있어도 번들에 싣습니다(없는 노드가 받고, 있는 노드는
+`rhel_install_rpms` 가 건너뜁니다). 의존성까지 그렇게 할 수는 없으니 빠진 것은 열한 마이너
+전부에서 번들 전체를 `rpm -U --test` 로 돌려 찾았습니다.
+
+rhel 8 의 검수는 2026-10-07 에 저장소가 닫힌 박스(보안그룹 egress 를 VPC 로 제한) 열한 대,
+8.0 부터 8.10 까지 마이너마다 한 대씩으로 했습니다. 각각 `setup.sh` → `setup-cluster.yml`
+완주, `reset-cluster.yml` 뒤 재완주이고 8.10 에서는 `install-packages.sh --update` 도
+통과했습니다. rhel 8 의 기준은 다섯입니다 — 8.10 저장소를 가진 기계 자신(`--root /`), 8.6·8.3·8.0
+AMI 의 `/var/lib/rpm` 사본, 마지막으로 8.0 사본을 `@core` 로 깎은 것 — 이고 8.10 기계에서 한 번에
+풉니다(BerkeleyDB 라 복사본의 `__db.*` 는 도구가 지웁니다). 위에서 이름 댄 libpcap·pkgconf·
+policycoreutils-python-utils 는 이 기준들이 데이터로 찾아내는 것이기도 합니다. 오프라인 박스는
+이미지의 chrony 가 가리키는 공개 NTP 에 못 붙어 `check-node-state.sh` 의 시계 검사에서
+멈추므로, 시험에서는 Amazon Time Sync(169.254.169.123, 링크로컬)로 돌려 두었습니다 — reset
+뒤에는 설치본이 남긴 chrony 가 상류 공개 서버를 가리키므로 재설치 전에 한 번 더. 옛 마이너
+박스는 `dnf erase` 가 닿지 않는 저장소의 메타데이터를 기다리느라 설치에 5분씩 더 걸립니다.
 
 푸는 명령은 `dnf install --downloadonly` 이지 `dnf download --resolve` 가 아닙니다. 후자는
 **없는 것만** 받습니다 — 깔려 있지만 너무 낮은 라이브러리는 그대로 두고, 그 구멍은 노드에서야
@@ -2537,7 +2761,11 @@ rpm 데이터베이스를 기준으로 풀므로, 그 마이너의 깨끗한 기
   10.0 노드는 `kill -TERM 1` 에서 PID 1 이 죽어 커널 패닉으로 갔고, 10.2 노드는 rpm 이
   다운그레이드를 거부했습니다. 그래서 도구는 트랜잭션에 `Downgrading:` 이 있으면 내려가려던 그
   버전을 `--exclude` 하고 다시 풉니다. 남는 길은 올라가는 것뿐이고, 그것이 최신 마이너 노드의
-  상태입니다.
+  상태입니다. 단, **내려가는 곳이 저장소의 최신 빌드이면 정당한 내림**이라 그대로 둡니다 — 8.6
+  이미지의 gmp 는 z-stream 빌드 `6.1.2-11.el8_6.1` 로, rpm 비교상 모든 뒤 마이너가 가진
+  `6.1.2-11.el8` 보다 높습니다. gmp-devel 은 정확히 그 버전을 요구하니 길은 내려가는 것뿐이고,
+  노드의 `rhel_install_rpms` 가 `--oldpackage` 로 그렇게 합니다. 거부하는 것은 저장소에 더 새
+  빌드가 있는데도 내려가는 경우뿐입니다.
 * **캐시.** `--downloadonly` 로 받은 rpm 은 dnf 에게 임시 파일이라, 그 기계에서 다음 `dnf install`
   이 성공하면 어디에 받았든 지웁니다. `keepcache` 를 켭니다. 뽑은 뒤 커널을 올리고 재부팅했더니
   디렉토리가 비어 있었습니다.
@@ -2553,10 +2781,30 @@ rpm 의존성으로는 3.0 이든 3.5 든 `libcrypto.so.3` 이라 아무도 막�
 자기 자신에게 ssh 를 못 해 첫 플레이북에서 멈추는 것으로 드러났습니다. 공식 AMI 는 9.2 부터 고쳐진
 openssh 를 들고 있어 거기서는 안 보였습니다.
 
-같은 rpm 이 두 대표에 걸리면 설치 순서에서 먼저 오는 디렉토리에만 남깁니다. **`python3.12` 는
-예외입니다** — `setup-venv.sh` 가 `install-packages.sh` 보다 먼저, 아무것도 깔리지 않은 제어
-노드에 그것을 깔기 때문에 `libtirpc` 처럼 `nfs-utils` 도 드는 것을 제 안에 다시 들어야 합니다.
-처음엔 그것을 빼서 9.8 의 `setup.sh` 가 첫 줄에서 죽었습니다.
+디렉토리는 노드가 까는 순서대로, **앞 디렉토리들이 올려 둔 상태 위에서** 풉니다. 디렉토리의
+대표를 앞 디렉토리들의 대표에 더해 전체를 트랜잭션 하나로 풀고, 거기 든 것 중 앞 디렉토리에
+없는 파일이 그 디렉토리의 몫입니다. 디렉토리마다 맨 처음 상태를 기준으로 따로 풀었을 때는
+서로 어긋났습니다 — 8.0 에서 `containerd` 가 8.0 의 `python3-policycoreutils` 에 맞는 옛
+`policycoreutils-python-utils` 를 고르는 동안 `nfs-utils` 는 그것을 8.10 것으로 올려 두어서,
+노드의 rpm 이 둘을 거부했습니다. 이름이 같은 rpm 을 뒤 디렉토리에서 지우는 dedupe 로는 버전이
+다른 둘을 못 잡습니다.
+
+그리고 dnf 가 끌고 온 것은 **저장소의 최신 빌드로 다시 요구**합니다. 해석기는 이름 댄 것은
+최신으로 고르지만 의존성은 요구를 가장 작은 변화로 채우는 빌드를 고르고, 옛 기준에서 그것은
+깔려 있는 옛 라이브러리에 맞는 빌드입니다. 8.0 에서 nfs-utils 는 8.0 의 `keyutils-libs` 를
+정확히 요구하는 `keyutils-1.5.10-6` 을 골랐고, 그것은 더 새 keyutils-libs 를 가진 8.9 노드에
+안 들어갑니다. 그래서 트랜잭션에 든 패키지 중 **기준에 없는 새 패키지**가 저장소 최신보다
+낮으면 그 빌드로 이름 대고 다시 풀기를 하나도 안 남을 때까지 반복합니다. 기준에 이미 있는
+패키지까지 최신으로 요구하면 lockstep 사슬을 타고 번집니다 — 10.0 의 커널 디렉토리가 dracut 과
+systemd 를 거쳐 bash 와 coreutils 까지 180개를 들고 나왔습니다. `release.yml` 이 박은 버전과
+커널은 그대로 둡니다. apt 는 손대는 패키지 전부를 candidate(최신)로 까는 터라 이 반복이 필요
+없습니다.
+
+한 노드가 순서대로 까는 디렉토리 묶음이 **그룹**이고, 새 그룹은 다시 맨 처음 상태에서
+시작합니다. `install-packages.sh` 가 까는 디렉토리들이 한 그룹, `setup-venv.sh` 가 그보다 먼저
+제어 노드에만 까는 `python3.12`(우분투는 python 디렉토리 넷) 가 한 그룹, rhel 10 의 커널이 한
+그룹입니다. python 그룹이 `libtirpc` 처럼 `nfs-utils` 도 드는 것을 제 안에 다시 드는 이유이고,
+처음에 그것을 빼서 9.8 의 `setup.sh` 가 첫 줄에서 죽었습니다.
 
 이 모든 것에도 클라우드 이미지는 최소 설치가 아닙니다. 셈이 맞는지는 지원 하한 마이너의 깨끗한
 기계에 저장소 없이 번들 전체를 까는 것으로 봅니다 — 그런 기계에서 `setup-cluster.yml` 을 돌리는
@@ -2598,13 +2846,14 @@ apt 라서 rhel 쪽 함정 넷 중 둘만 남습니다. **버전**은 `apt-cache
 이미 최신으로 들고 있는 대표는 디렉토리가 아예 없고 (24.04 의 `iptables`, `ethtool`) 노드
 스크립트가 그것을 건너뜁니다 — `dpkg -R -i` 는 deb 없는 디렉토리를 에러로 봅니다. python
 디렉토리는 `setup-venv.sh` 가 까는 순서대로 (22.04: `python3.10`, `python3`,
-`python3-distutils`, `python3.10-venv`; 24.04: `python3.12`, `python3.12-venv`) 본 dedupe 뒤에
-따로 풀고 저희끼리만 dedupe 합니다. 손으로 채우던 시절의 `libltdl7` (docker 29 는 더 이상 안
+`python3-distutils`, `python3.10-venv`; 24.04: `python3.12`, `python3.12-venv`) 본 그룹과 따로,
+제 그룹으로 풉니다. 손으로 채우던 시절의 `libltdl7` (docker 29 는 더 이상 안
 원함), `rsync` (아무도 안 씀), 22.04 `systemd` 안의 `libudev-dev` 는 사라졌습니다. 24.04 의
 `systemd-dev` 는 apt 가 systemd 를 올리며 같이 올리는 것이라 남습니다.
 
 검수는 2026-10-06 에 저장소가 닫힌 박스(보안그룹 egress 를 VPC 로 제한)로 포인트 릴리스
-전부에서 했습니다 — 22.04 GA 부터 22.04.5 까지 여섯, 24.04 GA 부터 24.04.4 까지 다섯. 각각
+전부에서 했습니다 — 22.04 GA 부터 22.04.5 까지 여섯, 24.04 GA 부터 24.04.4 까지 다섯, 그리고
+2026-10-20 에 24.04.5 (당시의 최신 AMI; 번들은 dpkg 로만 깔리므로 저장소가 열린 박스로 충분했습니다). 각각
 `setup.sh` → `setup-cluster.yml` 완주, `reset-cluster.yml` 뒤 재완주이고, 22.04 GA 에서는
 `install-packages.sh --update` 도 통과했습니다. 포인트별 AMI 는 이름에 포인트가 없어서
 cloud-images 의 manifest 에 적힌 `base-files` 버전을 그 패키지의 changelog("bump version to
@@ -3123,6 +3372,37 @@ timesyncd 는 `timedatectl timesync-status` 에게 묻습니다. `show-timesync`
 돌지 않습니다.** 대신 형식화된 시간 문자열을 읽습니다. 부호 하나에 `<값><단위>` 조각이 systemd 가
 고른 만큼 붙은 것이고, 그렇게 읽히지 않는 것은 위의 침묵으로 갑니다.
 
+=== ki cp 노드는 자기 ntp 서버를 따르지 않습니다
+
+2026-10-20 에 로컬 시계 폴백(`ki_cp_ntp_server_local_fallback`)을 넣으면서 찾은 것입니다. ki cp 의 ntp
+서버는 `cturra/ntp` 컨테이너의 chrony 이고 `-x` 로 돕니다 — 호스트 시계를 재어 보정값을 내놓지만 시계를
+만지지는 못합니다. 그런데 2026-10-20 까지는 **모든 노드가, ki cp 노드 자신까지,** 이 컨테이너를
+따랐습니다. ki cp 노드의 timesyncd 는 컨테이너가 말하는 시간으로 호스트 시계를 밀고, 컨테이너는 밀린
+시계를 다시 재어 그만큼을 주파수 오차로 배웁니다. 상류가 답하는 동안은 둘 다 상류에 수렴해 겉으로
+안 보이지만 배운 주파수는 쓰레기입니다 — 단일 노드에서 컨테이너는 −471ppm, timesyncd 는 상한인
++500ppm 이었습니다. 상류를 끊자 컨테이너는 그 주파수로 외삽한 보정값을 계속 내놓고 timesyncd 는 폴링마다
+그만큼 시계를 밀어, **25분에 11초**가 어긋났습니다.
+
+그래서 ki cp 노드는 `ki_cp_ntp_server_upstream_servers` 의 상류를 직접 따릅니다(`setup-ntp-client.sh`
+가 `group_names` 로 가릅니다). 같은 조건에서 다시 재니 12분 동안 호스트 시계가 바깥 기준과 0초
+차이였고 컨테이너는 자기 모델(24ppm)대로 10분에 14ms 만 벌어졌습니다. RHEL 9.8 에서도 같았습니다(호스트
+chrony 6.8ppm, 컨테이너 8.9ppm). timesyncd 의 `FallbackNTP=` 를 비우는 것도 이때 넣었습니다 — 비워 두지
+않으면 따를 것이 없는 우분투 노드가 `ntp.ubuntu.com` 을 찾아갑니다.
+
+상류 목록이 **비면** ki cp 노드도 예전처럼 자기 컨테이너를 따릅니다. 잴 것이 없는 컨테이너는 보정값 0 으로
+호스트 시계를 그대로 내놓으므로 되먹임이 돌지 않고, 아무것도 안 따르면 `timedatectl` 이 영영 동기 안 됨이라
+시계 검사가 ki cp 노드를 항상 거부하기 때문입니다. 상류가 있는 사이트에서 상류가 끊긴 동안 ki cp 노드의
+데몬이 다시 시작되면 그 노드는 동기 안 됨이 되고 검사에 걸립니다 — 호스트 chrony 에 `local stratum 10` 을
+줘 봤지만 chronyc 는 stratum 10/Normal 이라 해도 커널의 동기 플래그를 세우지 않아 `timedatectl` 은 그대로
+"no" 였습니다. 다른 노드들은 컨테이너의 stratum 10 을 따라 멀쩡하니, 그 노드만 상류가 돌아올 때까지
+기다리거나 검사를 `null` 로 끕니다.
+
+폴백 자체는 상류가 끊긴 것만으로는 드러나지 않습니다. chrony 는 마지막 동기 상태를 며칠 동안
+유지하며 계속 stratum 2 로 답합니다(루트 분산이 자라는 속도가 그만큼 느립니다). 갈리는 것은 **ntp 서버가
+다시 시작된 뒤** — 재부팅, reset 뒤 재설치 — 입니다. 폴백이 있으면 그 자리에서 stratum 10 으로 자기
+시계를 내놓고 노드들이 따르며 `check-node-state.yml` 이 통과하고, 없으면 아무것도 내놓지 않아 노드들이
+동기를 못 잡습니다. 상류가 돌아오면 폴링 한두 번에 상류로 돌아갑니다.
+
 === 알람은 좁게 묻고, 못 물으면 넘어갑니다
 
 `add-node`, `remove-node`, `upgrade-cluster` 에서만 묻습니다. 세우는 중에는 물어볼 etcd 가 없고,
@@ -3400,3 +3680,82 @@ kubelet 설정은 두 번 렌더됩니다 — 클러스터 기준선과 노드�
 검증기는 절대경로가 아닌 경로를 거부하는데, `/var/lib/k8s-installer` 는 윈도우에서 절대경로가
 아닙니다. 이 저장소의 모든 파일이 리눅스 노드에서 소비된다는 전제(`.gitattributes`)와 같은 자리라
 따로 우회하지 않습니다.
+
+== root 가 아닌 사용자로 노드에 들어가기
+
+플레이북은 노드에서 하는 모든 일을 `sudo` 로 합니다 — 스크립트 호출 146곳이 전부 그렇고, 모듈을
+쓰는 자리는 `become` 입니다. 그래서 들어가는 사용자가 root 인지는 거의 아무 데서도 상관이 없었는데,
+딱 한 종류의 자리가 root 를 요구했습니다. **노드 사이로 파일을 옮기는 자리**입니다. 제어 노드에서
+`sudo scp` 로 `root@노드:/tmp/k8s-installer/...` 에 밀어 넣었고, 그것은 세 가지를 root 에 묶어
+두었습니다. 제어 노드의 scp 가 root 로 뜨므로 쓰는 키가 `/root/.ssh` 의 것이었고, 노드의 받는 쪽이
+root 라야 root 가 `mkdir` 로 만든 755 디렉토리에 쓸 수 있었고, 같은 이유로 노드의
+`/etc/k8s-installer/pki` 에 바로 떨어뜨릴 수 있었습니다. 그 세 가지가 "모든 노드의 root 에 제어
+노드의 키를 등록한다" 는 요구였습니다.
+
+=== scp 는 원격에서 sudo 를 못 합니다
+
+`sudo scp` 에서 `sudo` 를 떼면 키는 사용자의 것이 되지만, 받는 쪽 문제는 그대로입니다. scp 는 로그인한
+사용자로 파일을 놓을 뿐이고 그 사용자에게 root 의 디렉토리는 닫혀 있습니다. 그래서 전송을 두 종류로
+갈랐습니다.
+
+작은 파일 — pki 네 개, ki-ca.crt, join-credentials, ansible 아카이브 — 은 ansible 의 `copy` 와
+`fetch` 로 옮기고 `become` 을 붙입니다. `copy` 는 사용자로 올려 root 로 놓고, `fetch` 는 `become` 이면
+`slurp` 를 거쳐 root 로 읽어 제어 노드에 사용자로 씁니다. 그래서 받는 쪽이 root 의 디렉토리든 600 의
+개인키든 상관이 없고, 모드도 `mode` 로 적어 줍니다. scp 는 원본의 모드를 그대로 옮겼지만 `copy` 는
+umask 로 놓으므로, 적지 않으면 개인키가 644 로 떨어집니다. 그 표가 `ki_pki_files` 입니다.
+
+**payload 만 scp 로 남겼습니다.** `setup-k8s-installer.yml` 과 `upgrade-k8s-installer.yml` 이 번들과
+스크립트를 보내는 자리인데, 노드에 아직 venv 가 없어 모듈을 쓸 수 없고 (그래서 그 플레이북은 `raw`
+로만 되어 있습니다), 1.9G 를 `slurp` 로 메모리에 실을 수도 없습니다. 시스템 python 으로 `copy` 를
+돌리는 길은 RHEL 8 이 `platform-python` 만 들고 있어 인터프리터 탐색이라는 새 의존성이 됩니다.
+사용자 권한 scp 로, 사용자가 쓸 수 있는 디렉토리에 놓고 `sudo tar xf` 하는 것이 그 자리의 답입니다.
+
+=== 임시 디렉토리는 들어간 사용자의 것입니다
+
+그러려면 `/tmp/k8s-installer` 가 그 사용자의 것이어야 합니다. 사용자 권한 scp 가 거기 쓰고, `fetch`
+가 제어 노드의 거기에 씁니다. 모든 플레이북이 `sudo mkdir -p` 로 만들던 것을 `ki_create_tmp_root_cmd`
+하나로 모아 `sudo install -d -m 0700 -o <사용자>` 로 바꿨습니다. `mkdir` 과 달리 `install -d` 는
+**이미 있는 디렉토리의 소유와 모드도 바꾸므로**, root 로 돌던 릴리스가 남긴 디렉토리를 그대로
+넘겨받습니다 (coreutils 8.32 로 확인). root 스크립트는 그 안에 여전히 씁니다 — 남의 디렉토리가
+root 를 막지는 않습니다.
+
+0700 은 덤이 아니라 고친 것입니다. 755 디렉토리에 root 가 umask 로 놓던 join-credentials 는 그
+기계의 아무 사용자나 읽을 수 있었습니다. 지금은 디렉토리가 닫혀 있고 credentials 는 0600 입니다.
+
+=== 제어 노드에서는 root 가 필요 없는 일에 sudo 를 안 씁니다
+
+`copy` 는 원본을 **ansible 을 실행한 사용자로** 읽습니다. `become` 은 건너편에만 걸립니다. 그래서
+`create-pki.sh` 를 `sudo` 로 돌리면 openssl 이 root 의 600 으로 쓴 개인키를 그 사용자가 읽지 못해
+다음 태스크에서 죽습니다. 그 스크립트는 `/opt` 를 읽고 임시 디렉토리에 쓰기만 하므로 사용자로
+돌립니다. 반면 payload 와 ansible 아카이브를 만드는 `tar cf` 는 `sudo` 를 그대로 두었습니다 —
+`ansible/files` 에 운영자가 root 전용 모드로 둔 파일이 있을 수 있고, 결과 아카이브는 644 라 사용자가
+읽을 수 있기 때문입니다.
+
+=== 비밀번호 sudo 는 지원하지 않습니다
+
+`become` 만 썼다면 `--ask-become-pass` 로 받을 수 있었겠지만 셸 태스크 안의 `sudo` 144곳에는
+비밀번호를 넘길 자리가 없습니다. 그래서 `NOPASSWD` 를 요구하고, 그것을 **첫 태스크에서** 봅니다 —
+`check-control-node.yml` 이 제어 노드에서, `setup-k8s-installer.yml` 이 모든 노드에서 `sudo -n true`
+를 돕니다. 안 되는 사용자는 어딘가의 첫 `sudo` 가 비밀번호를 기다리며 매달리는 대신 거기서 멈춥니다.
+RHEL 8 이상과 우분투는 `requiretty` 가 기본으로 없어서 같은 검사가 그것도 겸합니다.
+
+얻는 것은 분명히 해 둘 필요가 있습니다. 비밀번호 없는 `sudo` 를 가진 사용자는 root 입니다. 이 변경은
+설치본의 권한을 줄이지 않습니다. root 로그인을 금지하는 정책을 따르고, 누가 들어와 무엇을 `sudo`
+했는지가 노드의 로그에 남게 하는 것이 전부입니다.
+
+=== kubeconfig 는 두 홈에 놓습니다
+
+`init-k8s-cluster.sh` 는 `$HOME/.kube/config` 를 놓는데, `sudo` 아래라 그 홈은 root 의 것입니다.
+root 로 들어가던 때는 운영자가 곧 root 라 맞았지만, 이제 운영자는 `SUDO_USER` 입니다. 그 홈에도 한
+부를 놓고 소유를 `SUDO_UID` 로 맞춥니다. 갱신(`renew-k8s-certs.sh`)과 리셋
+(`reset-k8s-node-kubelet.sh`)도 같은 두 자리를 봅니다. root 로 들어가면 `SUDO_USER` 가 root 라
+전과 같이 한 자리입니다.
+
+=== 변수는 vars.yml 에 있습니다
+
+`ansible_ssh_user: root` 는 constant-vars.yml 에 있었고, 거기 있으면 inventory.yml 의 `all: vars:` 로
+덮지 못합니다 (group_vars/all 이 더 우선합니다). 사이트가 정하는 값이므로 vars.yml 로 옮기고 현행
+이름인 `ansible_user` 로 바꿨습니다. `validate-hostvars.py` 는 vars.yml 의 모든 이름이 `ki_var_classes`
+에 있기를 요구하는데, 접속 변수는 적용할 것이 없으므로 inventory.yml 에 이미 있던 `ansible_` 접두어
+예외를 vars.yml 에도 두었습니다. 변수를 아예 적지 않으면 ansible 은 실행한 사용자로 들어가고, 남은
+scp 둘과 ssh 하나가 쓰는 `ki_ssh_user` 도 같은 기본값을 따릅니다.
